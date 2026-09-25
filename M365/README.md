@@ -84,6 +84,17 @@ The script will try to gather stats for the Recoverable Items folder. This can a
 ./Get-RubrikM365SizingInfo.ps1 -SkipRecoverableItems $true
 ```
 
+Each Recoverable Items mailbox is retried when a transient error such as throttling or a token timeout is hit, just like In Place Archive above. Permanent errors are not retried. Mailboxes that still cannot be read are counted rather than silently dropped: the script prints how many failed, writes the full list to a `RIFFailures-<timestamp>.csv`, and notes on the HTML report that the Recoverable Items totals are incomplete. You can tune the retries with:
+```
+./Get-RubrikM365SizingInfo.ps1 -RIFMaxAttempts 5 -RIFRetryDelaySeconds 10
+```
+
+As Recoverable Items stats are gathered they are written to a checkpoint file, `./rif-checkpoint.csv` by default. If a run is interrupted, re-run the same command with `-ResumeRIF $true` and only the mailboxes not already gathered will be queried:
+```
+./Get-RubrikM365SizingInfo.ps1 -ResumeRIF $true
+```
+The checkpoint is keyed by user principal name, so it is safe if the tenant's mailbox list changed between runs, and mailboxes that failed previously are retried on resume. A checkpoint written against a different tenant is refused. Use the same `-RIFCheckpointFilename` on both runs if you changed it from the default. Starting a fresh run when a checkpoint already exists renames the old one to `rif-checkpoint.csv.bak-<timestamp>` rather than deleting it.
+
 The script will calculate annual growth rates for 10%, 20%, and 30% annual growth rates. You can change the 30% to a custom value such as 40% by using the following flag:
 ```
 ./Get-RubrikM365SizingInfo.ps1 -AnnualGrowth 40
