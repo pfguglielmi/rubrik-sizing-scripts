@@ -235,17 +235,17 @@ function Measure-AverageGrowth {
   )
   $UsageReport = Import-Csv -Path $ReportCSV | Sort-Object -Property "Report Date" -Descending
   $ReportDays = $UsageReport[0].'Report Period'
-  $LatestUsageGB = [math]::Round($UsageReport[0].'Storage Used (Byte)' / 1GB, 2)
-  $EarliestUsageGB = [math]::Round($UsageReport[-1].'Storage Used (Byte)' / 1GB, 2)
+  $LatestUsageGB = [math]::Round($UsageReport[0].'Storage Used (Byte)' / $capacityMetric, 2)
+  $EarliestUsageGB = [math]::Round($UsageReport[-1].'Storage Used (Byte)' / $capacityMetric, 2)
   $GrowthOverPeriod = [math]::Round($LatestUsageGB - $EarliestUsageGB, 2)
   $AvgGrowthPerDay = $GrowthOverPeriod / $ReportDays
   $GrowthPerYearGB = [math]::Round($AvgGrowthPerDay * 365, 2)
   $GrowthPerYearPct = [math]::Round($GrowthPerYearGB / $LatestUsageGB, 2)
   Write-Host "$ReportName historical storage usage:"
-  Write-Host "  - Usage on $($UsageReport[0].'Report Date'): $LatestUsageGB GB"
-  Write-Host "  - Usage on $($UsageReport[-1].'Report Date'): $EarliestUsageGB GB"
-  Write-Host "  - Growth over $ReportDays days: $GrowthOverPeriod GB"
-  Write-Host "  - Growth annualized per year: $GrowthPerYearGB GB, $($GrowthPerYearPct * 100)%"
+  Write-Host "  - Usage on $($UsageReport[0].'Report Date'): $LatestUsageGB $capacityDisplay"
+  Write-Host "  - Usage on $($UsageReport[-1].'Report Date'): $EarliestUsageGB $capacityDisplay"
+  Write-Host "  - Growth over $ReportDays days: $GrowthOverPeriod $capacityDisplay"
+  Write-Host "  - Growth annualized per year: $GrowthPerYearGB $capacityDisplay, $($GrowthPerYearPct * 100)%"
   return $GrowthPerYearPct
 }
 
@@ -1777,7 +1777,7 @@ $totalStorage = $ExchangeDetails.'Total Storage Used' + $OneDriveDetails.'Storag
 $totalItems = $ExchangeDetails.'Total Items' + $OneDriveDetails.'Total Files' +
   $SharePointDetails.'Account Files'
 
-$totalStorageGB = [math]::round($totalStorage / 1GB, 2)
+$totalStorageGB = [math]::round($totalStorage / $capacityMetric, 2)
 
 #region HTML Code for Output
 $HTML_CODE = @"
@@ -2194,32 +2194,32 @@ $HTML_CODE = @"
                     <tr>
                         <th>Mailbox Type</th>
                         <th>Count</th>
-                        <th>Size (GB)</th>
+                        <th>Size ($capacityDisplay)</th>
                         <th>Items</th>
-                        <th>Per Mailbox Size (GB)</th>
+                        <th>Per Mailbox Size ($capacityDisplay)</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td>User Mailboxes</td>
                         <td>$($ExchangeDetails.'User Mailboxes')</td>
-                        <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / 1GB, 2))</td>
+                        <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / $capacityMetric, 2))</td>
                         <td>$($ExchangeDetails.'User Items No Archive')</td>
-                        <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / 1GB / $ExchangeDetails.'User Mailboxes', 2))</td>
+                        <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / $capacityMetric / $ExchangeDetails.'User Mailboxes', 2))</td>
                     </tr>
                     <tr>
                         <td>Shared Mailboxes</td>
                         <td>$($ExchangeDetails.'Shared Mailboxes')</td>
-                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / 1GB, 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / $capacityMetric, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { $ExchangeDetails.'Shared Items No Archive' })</td>
-                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / 1GB / $ExchangeDetails.'Shared Mailboxes', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / $capacityMetric / $ExchangeDetails.'Shared Mailboxes', 2) })</td>
                     </tr>
                     <tr>
                         <td>Archive Mailboxes</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes Failed' -gt 0) { "$($ExchangeDetails.'Archive Mailboxes') of $($ExchangeDetails.'Archive Mailboxes Found') found" } else { $ExchangeDetails.'Archive Mailboxes' })</td>
-                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB, 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / $capacityMetric, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { $ExchangeDetails.'Archive Items' })</td>
-                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Archive Storage Used' / $capacityMetric / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
                     </tr>
                     <tr>
                         <td>Recoverable Items</td>
@@ -2231,9 +2231,9 @@ $HTML_CODE = @"
                     <tr style="font-weight: bold; background-color: #f2f2f2;">
                         <td>Total</td>
                         <td>$($ExchangeDetails.'Total Mailboxes')</td>
-                        <td>$([math]::round($ExchangeDetails.'Total Storage Used' / 1GB, 2))</td>
+                        <td>$([math]::round($ExchangeDetails.'Total Storage Used' / $capacityMetric, 2))</td>
                         <td>$($ExchangeDetails.'Total Items')</td>
-                        <td>$([math]::round($ExchangeDetails.'Total Storage Used' / 1GB / $ExchangeDetails.'Total Mailboxes', 2))</td>
+                        <td>$([math]::round($ExchangeDetails.'Total Storage Used' / $capacityMetric / $ExchangeDetails.'Total Mailboxes', 2))</td>
                     </tr>
                 </tbody>
             </table>
@@ -2272,17 +2272,17 @@ $HTML_CODE = @"
                 <thead>
                     <tr>
                         <th>Number of User OneDrives</th>
-                        <th>Total Size (GB)</th>
+                        <th>Total Size ($capacityDisplay)</th>
                         <th>Total # of Files</th>
-                        <th>Per Account Size (GB)</th>
+                        <th>Per Account Size ($capacityDisplay)</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td>$($OneDriveDetails.'Accounts')</td>
-                        <td>$([math]::round($OneDriveDetails.'Storage Used' / 1GB, 2))</td>
+                        <td>$([math]::round($OneDriveDetails.'Storage Used' / $capacityMetric, 2))</td>
                         <td>$($OneDriveDetails.'Total Files')</td>
-                        <td>$([math]::round($OneDriveDetails.'Storage Used' / 1GB / $OneDriveDetails.'Accounts', 2) )</td>
+                        <td>$([math]::round($OneDriveDetails.'Storage Used' / $capacityMetric / $OneDriveDetails.'Accounts', 2) )</td>
                     </tr>
                 </tbody>
             </table>
@@ -2334,17 +2334,17 @@ $HTML_CODE = @"
                 <thead>
                     <tr>
                         <th>Total Sites</th>
-                        <th>Total Size (GB)</th>
+                        <th>Total Size ($capacityDisplay)</th>
                         <th>Total # of Files</th>
-                        <th>Per Site Size (GB)</th>
+                        <th>Per Site Size ($capacityDisplay)</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td>$($SharePointDetails.'Sites')</td>
-                        <td>$([math]::round($SharePointDetails.'Sites Storage Used' / 1GB, 2))</td>
+                        <td>$([math]::round($SharePointDetails.'Sites Storage Used' / $capacityMetric, 2))</td>
                         <td>$($SharePointDetails.'Account Files')</td>
-                        <td>$([math]::round($SharePointDetails.'Sites Storage Used' / 1GB / $SharePointDetails.'Sites', 2) )</td>
+                        <td>$([math]::round($SharePointDetails.'Sites Storage Used' / $capacityMetric / $SharePointDetails.'Sites', 2) )</td>
                     </tr>
                 </tbody>
             </table>
@@ -2368,9 +2368,9 @@ $HTML_CODE = @"
                 <thead>
                     <tr>
                         <th>Total users or accounts</th>
-                        <th>Total Size (GB)</th>
+                        <th>Total Size ($capacityDisplay)</th>
                         <th>Total # of Items & Files</th>
-                        <th>Per User/Account Size (GB)</th>
+                        <th>Per User/Account Size ($capacityDisplay)</th>
                     </tr>
                 </thead>
                 <tbody>
