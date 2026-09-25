@@ -17,6 +17,11 @@
     you can use the flag to skip gathering in place archive data and try to provide
     an estimate.
 
+    Each In Place Archive mailbox is retried a few times when a transient error such as
+    throttling or token expiry is hit. Mailboxes that still cannot be read are counted and
+    written to an ArchiveFailures CSV, and the report states that the archive totals are
+    incomplete, rather than dropping those mailboxes from the totals silently.
+
     The M365 Usage Reports do not contain information on Exchange Recoverable Items Folder.
     By default, the script will try to gather this information by looping through
     every user and gathering that info directly. Unfortunately,
@@ -46,6 +51,9 @@
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 SkipRecoverableItems $true
     Skip gathering Recoverable Items hierarchy.
 
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ArchiveMaxAttempts 5 -ArchiveRetryDelaySeconds 10
+    Retry each In Place Archive mailbox up to 5 times, starting with a 10 second backoff.
+
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ADGroup <ad_group_name>
     Gather user info for only the AD Group specified.
 .NOTES
@@ -55,6 +63,9 @@
     By: Steven Tong
     Updated: 26/08/24
     By: Sameer Arora
+    Updated: 25/09/26
+    By: In Place Archive gathering made resilient - retry with backoff and failure
+        accounting.
 #>
 
 [CmdletBinding()]
@@ -82,6 +93,14 @@ param (
     # Whether or not to skip gathering Recoverable Items fodler items, which can timeout
     [Parameter()]
     [bool]$SkipRecoverableItems = $true,
+    # Number of attempts per mailbox when gathering In Place Archive stats (1 means no retry)
+    [Parameter()]
+    [ValidateRange(1, 10)]
+    [int]$ArchiveMaxAttempts = 3,
+    # Seconds to wait before the first In Place Archive retry; doubles each attempt, capped at 60
+    [Parameter()]
+    [ValidateRange(0, 300)]
+    [int]$ArchiveRetryDelaySeconds = 5,
     # Number of days to get historical stats for: 7, 30, 90, 180
     [Parameter()]
     [Int]$Period = 180,
@@ -103,7 +122,7 @@ $outFilename = "./Rubrik-M365-Sizing-$dateStringHH.html"
 # Folder to export CSVs to
 $ExportFolder = '.'
 
-$Version = "6.3"
+$Version = "6.4"
 
 $ProgressPreference = 'SilentlyContinue'
 
@@ -814,6 +833,159 @@ Disconnect-MgGraph
 $ArchiveMailboxes = $ExchangeUsageReportUsers | Where-Object { $_.'Has Archive' -eq 'TRUE' }
 $ArchiveMailboxesCount = $ArchiveMailboxes.Count
 
+# Classify an Exchange Online error as transient (worth retrying) or permanent. Permanent
+# per-mailbox errors must never be retried: across tens of thousands of mailboxes the backoff
+# sleeps alone would add hours of wall clock to a run that is already measured in days.
+function Test-ExoTransientError {
+  param (
+    [Parameter(Mandatory = $true)]
+    [System.Management.Automation.ErrorRecord]$ErrorRecord
+  )
+
+  $Msg = [string]$ErrorRecord.Exception.Message
+  $Fqid = [string]$ErrorRecord.FullyQualifiedErrorId
+
+  # Permanent: retrying these can never succeed, so fail fast and keep the run moving.
+  # Apostrophes are matched as '.' so both the straight and typographic forms are caught.
+  if ($Fqid -match 'ManagementObjectNotFoundException') { return $false }
+  if ($Msg -match "couldn.t be found on") { return $false }
+  if ($Msg -match '(?i)archive' -and $Msg -match "(?i)(isn.t enabled|is not enabled|doesn.t have|does not have|not enabled for)") { return $false }
+  if ($Msg -match "(?i)not a valid (SmtpAddress|value)" -or $Fqid -match 'ParameterBindingValidationException') { return $false }
+  if ($Msg -match "(?i)(insufficient access rights|you don.t have permission|isn.t assigned to any management roles)") { return $false }
+
+  # Transient by exception type. More reliable than message text for the network family.
+  $TypeNames = @()
+  $Ex = $ErrorRecord.Exception
+  if ($null -ne $Ex) {
+    $TypeNames += $Ex.GetType().FullName
+    if ($null -ne $Ex.InnerException) { $TypeNames += $Ex.InnerException.GetType().FullName }
+  }
+  foreach ($TypeName in $TypeNames) {
+    if ($TypeName -match '(HttpRequestException|TaskCanceledException|TimeoutException|WebException|SocketException|IOException)') { return $true }
+  }
+
+  # Transient by message.
+  if ($Msg -match '(?i)(throttl|429|too many requests)') { return $true }
+  if ($Msg -match '(?i)(micro delay|budget.*exceeded|exceeded.*budget)') { return $true }
+  if ($Msg -match '(?i)(token.*expired|expired.*token|AADSTS700082|AADSTS50173|unauthorized|\b401\b|authentication failed)') { return $true }
+  if ($Msg -match '(?i)(timed out|timeout|task was canceled|operation has timed out)') { return $true }
+  if ($Msg -match '(?i)(connection was closed|connection reset|unable to connect|remote server returned an error|remote name could not be resolved)') { return $true }
+  if ($Msg -match '(?i)(ServiceUnavailable|InternalServerError|BadGateway|service is unavailable|try again later|temporary)') { return $true }
+  if ($Msg -match '(?i)(starting a command on the remote server failed|cmdlet not found|pipeline.*broken)') { return $true }
+
+  # Unknown: treat as transient. An unknown-but-transient error silently corrupts the total,
+  # while an unknown-but-permanent one only costs time - and that cost is bounded by the
+  # consecutive-failure breaker in the gathering loop below.
+  return $true
+}
+
+# A session error is a transient error that a sleep alone will never fix: the EXO connection or
+# access token is dead and has to be re-established before the next attempt. Deliberately a
+# strict subset of Test-ExoTransientError - throttling and 5xx are excluded, because reconnecting
+# while being throttled makes the throttling worse.
+function Test-ExoSessionError {
+  param (
+    [Parameter(Mandatory = $true)]
+    [System.Management.Automation.ErrorRecord]$ErrorRecord
+  )
+
+  $Msg = [string]$ErrorRecord.Exception.Message
+
+  if ($Msg -match '(?i)(token.*expired|expired.*token|AADSTS700082|AADSTS50173|unauthorized|\b401\b|authentication failed)') { return $true }
+  if ($Msg -match '(?i)(starting a command on the remote server failed|cmdlet not found|pipeline.*broken)') { return $true }
+  if ($Msg -match '(?i)(connection was closed|connection reset|unable to connect)') { return $true }
+
+  return $false
+}
+
+# Get In-Place Archive statistics for one mailbox with bounded retry and exponential backoff.
+# Never throws: always returns a result object, so the caller loop stays flat and every outcome -
+# success or failure - is recorded exactly once.
+function Get-ArchiveMailboxStats {
+  param (
+    [Parameter(Mandatory = $true)]
+    [string]$UserPrincipalName,
+
+    [Parameter()]
+    [int]$MaxAttempts = 3,
+
+    [Parameter()]
+    [int]$RetryDelaySeconds = 5,
+
+    [Parameter()]
+    [bool]$AllowReconnect = $true,
+
+    [Parameter()]
+    [bool]$ShowRetryDetail = $false
+  )
+
+  $Result = [PSCustomObject] @{
+    "UserPrincipalName" = $UserPrincipalName
+    "ArchiveSize" = [long]0
+    "ArchiveItems" = [long]0
+    "Status" = 'Failed'
+    "Attempts" = 0
+    "ErrorType" = ''
+    "ErrorMessage" = ''
+  }
+
+  for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+    $Result.Attempts = $Attempt
+    try {
+      # -ErrorAction Stop is required: without it a non-terminating error skips the catch and
+      # leaves $ArchiveMailboxStats null, which used to fall through into the size parse below.
+      $ArchiveMailboxStats = Get-EXOMailboxStatistics -Archive -Identity $UserPrincipalName -ErrorAction Stop
+
+      # Guarded parse. A bare '-match' leaves $Matches holding the PREVIOUS mailbox's capture when
+      # it fails, which silently credited this mailbox with that mailbox's byte count.
+      if ([string]$ArchiveMailboxStats.TotalItemSize -notmatch '\(([^)]+) bytes\)') {
+        $Result.Status = 'Failed'
+        $Result.ErrorType = 'UnparsableSize'
+        $Result.ErrorMessage = "Could not parse TotalItemSize: $($ArchiveMailboxStats.TotalItemSize)" -replace '[,"\r\n]', ' '
+        return $Result
+      }
+
+      $Result.ArchiveSize = [long]($Matches[1] -replace ',', '')
+      $Result.ArchiveItems = [long]$ArchiveMailboxStats.ItemCount
+      $Result.Status = 'OK'
+      $Result.ErrorType = ''
+      $Result.ErrorMessage = ''
+      return $Result
+    } catch {
+      $ErrorRecord = $_
+      $ExceptionName = $ErrorRecord.Exception.GetType().Name
+      $Result.ErrorMessage = ([string]$ErrorRecord.Exception.Message) -replace '[,"\r\n]', ' '
+      if ($Result.ErrorMessage.Length -gt 200) { $Result.ErrorMessage = $Result.ErrorMessage.Substring(0, 200) }
+
+      if (-not (Test-ExoTransientError -ErrorRecord $ErrorRecord)) {
+        $Result.Status = 'Failed'
+        $Result.ErrorType = "Permanent:$ExceptionName"
+        return $Result
+      }
+
+      $Result.Status = 'Failed'
+      $Result.ErrorType = $ExceptionName
+
+      if ($Attempt -ge $MaxAttempts) { return $Result }
+
+      if ($ShowRetryDetail) {
+        Write-Host "[INFO] Retry $Attempt/$MaxAttempts for $UserPrincipalName after transient error: $($Result.ErrorMessage)"
+      }
+
+      # A dead token or session is never fixed by sleeping, so reconnect for those only.
+      if ($AllowReconnect -and (Test-ExoSessionError -ErrorRecord $ErrorRecord)) {
+        try { Reset-ExoConnection } catch {
+          Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
+        }
+      }
+
+      Start-Sleep -Seconds ([math]::Min(60, $RetryDelaySeconds * [math]::Pow(2, $Attempt - 1)))
+    }
+  }
+
+  return $Result
+}
+
 if ($SkipArchiveMailbox -eq $true) {
   Write-Host "Skipping gathering In Place Archive usage" -foregroundcolor green
 } else {
@@ -835,48 +1007,98 @@ if ($SkipArchiveMailbox -eq $true) {
   # Use a generic List to avoid O(N^2) array re-allocation on +=. With tens of
   # thousands of mailboxes the array-append cost alone was hours (SPARK-887257).
   $ArchiveMailboxList = [System.Collections.Generic.List[object]]::new()
+  $ArchiveFailedList = [System.Collections.Generic.List[object]]::new()
   $CurrentMailboxNum = 0
+  $ProcessedCount = 0
+  $ConsecutiveFailures = 0
+  $ArchiveConsecutiveFailureLimit = 25
+  $ArchiveRetryEnabled = $true
   Write-Host "Found $ArchiveMailboxesCount mailboxes with In Place Archives" -foregroundcolor green
-  do {
-    if ( ($CurrentMailboxNum % 10) -eq 0 ) {
-      Write-Host "[$CurrentMailboxNum / $ArchiveMailboxesCount] Processing mailboxes ..."
-    }
-    # Refresh the EXO connection periodically so the access token doesn't age out
-    # mid-run on very large tenants where the enumeration can take days.
-    if ($CurrentMailboxNum -gt 0 -and ($CurrentMailboxNum % $SkipInternval) -eq 0) {
-      Write-Host "[INFO] Refreshing Exchange Online connection at $CurrentMailboxNum / $ArchiveMailboxesCount to avoid token timeout."
-      try { Reset-ExoConnection } catch {
-        Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
+
+  # The do/while below runs once even on an empty collection, indexing [0] and querying a null
+  # identity. That is reachable whenever a tenant has no archives at all.
+  if ($ArchiveMailboxesCount -gt 0) {
+    do {
+      if ( ($CurrentMailboxNum % 10) -eq 0 ) {
+        Write-Host "[$CurrentMailboxNum / $ArchiveMailboxesCount] Processing mailboxes ..."
       }
-    }
-    $CurrentUser = $ArchiveMailboxes[$CurrentMailboxNum].'User Principal Name'
-    try {
-      $ArchiveMailboxStats = Get-EXOMailboxStatistics -Archive -Identity $CurrentUser
-      $MatchArchiveSize = $ArchiveMailboxStats.TotalItemSize -match '\(([^)]+) bytes\)'
-      $ArchiveSize = [long]($Matches[1] -replace ',', '')
-      $ArchiveStats = [PSCustomObject] @{
-        "UserPrincipalName" = $CurrentUser
-        "ArchiveSize" = $ArchiveSize
-        "ArchiveItems" = $ArchiveMailboxStats.ItemCount
+      $CurrentUser = $ArchiveMailboxes[$CurrentMailboxNum].'User Principal Name'
+      $AttemptsForThisMailbox = if ($ArchiveRetryEnabled) { $ArchiveMaxAttempts } else { 1 }
+      $ArchiveStats = Get-ArchiveMailboxStats -UserPrincipalName $CurrentUser -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $ArchiveRetryDelaySeconds -ShowRetryDetail $EnableDebug
+
+      if ($ArchiveStats.Status -eq 'OK') {
+        [void]$ArchiveMailboxList.Add($ArchiveStats)
+        $ConsecutiveFailures = 0
+        if (-not $ArchiveRetryEnabled) {
+          Write-Host "[INFO] Mailbox stats are succeeding again; re-enabling retries."
+          $ArchiveRetryEnabled = $true
+        }
+      } else {
+        [void]$ArchiveFailedList.Add($ArchiveStats)
+        Write-Host "[WARN] Could not get In Place Archive stats for $CurrentUser after $($ArchiveStats.Attempts) attempt(s): $($ArchiveStats.ErrorType)"
+        $ConsecutiveFailures += 1
+        # Bound the damage when something systemic is being misread as transient: without this,
+        # a tenant-wide outage would spend 15s of backoff on every one of tens of thousands of
+        # mailboxes before finishing.
+        if ($ArchiveRetryEnabled -and $ConsecutiveFailures -ge $ArchiveConsecutiveFailureLimit) {
+          Write-Host "[WARN] $ConsecutiveFailures mailboxes failed in a row. Disabling retries to avoid stalling the run; failures are still counted." -foregroundcolor yellow
+          $ArchiveRetryEnabled = $false
+          # With retries off, each mailbox gets a single attempt and so never reaches the
+          # session-recovery reconnect inside Get-ArchiveMailboxStats. A run of failures this
+          # long is most often a dead session, so reconnect once here - otherwise nothing
+          # re-establishes it until the periodic refresh, hundreds of mailboxes later, and all
+          # of those are recorded as failures a healthy connection would have read.
+          Write-Host "[INFO] Refreshing the Exchange Online connection before continuing."
+          try { Reset-ExoConnection } catch {
+            Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
+          }
+        }
       }
-      [void]$ArchiveMailboxList.Add($ArchiveStats)
-    } catch {
-      Write-Error "Error getting info for mailbox: $CurrentUser"
-    }
-    $CurrentMailboxNum += 1
-  } while ($CurrentMailboxNum -lt $ArchiveMailboxesCount)
+
+      $ProcessedCount += 1
+      # Refresh the EXO connection periodically so the access token doesn't age out mid-run on
+      # very large tenants where the enumeration can take days.
+      if ( ($ProcessedCount % $SkipInternval) -eq 0 ) {
+        Write-Host "[INFO] Refreshing Exchange Online connection at $CurrentMailboxNum / $ArchiveMailboxesCount to avoid token timeout."
+        try { Reset-ExoConnection } catch {
+          Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
+        }
+      }
+      $CurrentMailboxNum += 1
+    } while ($CurrentMailboxNum -lt $ArchiveMailboxesCount)
+  }
   $ArchiveMeasurementSize = $ArchiveMailboxList | Measure-Object -Property 'ArchiveSize' -Sum -Average
   $ArchiveMeasurementItems = $ArchiveMailboxList | Measure-Object -Property 'ArchiveItems' -Sum -Average
   $TotalArchiveSize = [math]::Round($($ArchiveMeasurementSize.Sum / $capacityMetric), 2)
   $TotalArchiveItems = $ArchiveMeasurementItems.Sum
+  $ArchiveSucceededCount = $ArchiveMailboxList.Count
+  $ArchiveFailedCount = $ArchiveFailedList.Count
   Write-Host "Finished gathering stats on mailboxes with In Place Archive" -foregroundcolor green
   Write-Host "Total # of mailboxes with In Place Archive: $ArchiveMailboxesCount" -foregroundcolor green
+  Write-Host "Successfully gathered: $ArchiveSucceededCount of $ArchiveMailboxesCount" -foregroundcolor green
   Write-Host "Total size of mailboxes with In Place Archive: $TotalArchiveSize $capacityDisplay" -foregroundcolor green
   Write-Host "Total # of items of mailboxes with In Place Archive: $TotalArchiveItems" -foregroundcolor green
+
+  if ($ArchiveFailedCount -gt 0) {
+    Write-Host ""
+    Write-Host "[WARN] $ArchiveFailedCount of $ArchiveMailboxesCount In Place Archive mailboxes could not be read." -foregroundcolor yellow
+    Write-Host "[WARN] The In Place Archive size and item totals above are INCOMPLETE and UNDER-REPORT this tenant." -foregroundcolor yellow
+    $ArchiveFailedList | Group-Object ErrorType | Sort-Object Count -Descending | ForEach-Object {
+      Write-Host "         $($_.Count) x $($_.Name)"
+    }
+    $ArchiveFailureCSV = "$ExportFolder\ArchiveFailures-$dateStringHH.csv"
+    $ArchiveFailedList | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $ArchiveFailureCSV -Encoding UTF8
+    Write-Host "[WARN] Full failure list written to: $ArchiveFailureCSV" -foregroundcolor yellow
+  }
 }
 
 if ($SkipArchiveMailbox -eq $false) {
-  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes' -Value $ArchiveMailboxesCount
+  # 'Archive Mailboxes' is the count actually read, not the population: it is the denominator of
+  # the per-mailbox average in the HTML report, and dividing a sum over successes by the full
+  # population understates every archive. The two are identical on a clean run.
+  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes' -Value $ArchiveSucceededCount
+  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes Found' -Value $ArchiveMailboxesCount
+  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes Failed' -Value $ArchiveFailedCount
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Storage Used' -Value $ArchiveMeasurementSize.Sum
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Items' -Value $ArchiveMeasurementItems.Sum
   $ExchangeTotalStorage = $ExchangeDetails.'Total Storage Used' + $ArchiveMeasurementSize.Sum
@@ -885,6 +1107,8 @@ if ($SkipArchiveMailbox -eq $false) {
   $ExchangeDetails.'Total Items' = $ExchangeTotalItems
 } else {
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes' -Value "Skipped ($ArchiveMailboxesCount)"
+  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes Found' -Value $ArchiveMailboxesCount
+  $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Mailboxes Failed' -Value 0
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Storage Used' -Value '-'
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Items' -Value '-'
 }
@@ -1440,7 +1664,7 @@ $HTML_CODE = @"
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { $ExchangeDetails.'Archive Mailboxes' })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { $ExchangeDetails.'Archive Items' })</td>
-                        <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
                     </tr>
                     <tr>
                         <td>Recoverable Items</td>
@@ -1458,6 +1682,7 @@ $HTML_CODE = @"
                     </tr>
                 </tbody>
             </table>
+            $(if ([int]$ExchangeDetails.'Archive Mailboxes Failed' -gt 0) { "<p style='color:#b00020;'>Note: $($ExchangeDetails.'Archive Mailboxes Failed') of $($ExchangeDetails.'Archive Mailboxes Found') In-Place Archive mailboxes could not be read. The Archive and Total rows above under-report actual usage. See the ArchiveFailures CSV produced alongside this report.</p>" })
         </div>
     </div>
 
