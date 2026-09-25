@@ -68,6 +68,17 @@ The script will try to gather In Place Archive sizes for each mailbox. However, 
 ./Get-RubrikM365SizingInfo.ps1 -SkipArchiveMailbox $true
 ```
 
+Each In Place Archive mailbox is retried when a transient error such as throttling or a token timeout is hit. Permanent errors, such as a mailbox that no longer exists, are not retried. Mailboxes that still cannot be read are counted rather than silently dropped: the script prints how many failed, writes the full list to an `ArchiveFailures-<timestamp>.csv`, and notes on the HTML report that the archive totals are incomplete. You can tune the retries with:
+```
+./Get-RubrikM365SizingInfo.ps1 -ArchiveMaxAttempts 5 -ArchiveRetryDelaySeconds 10
+```
+
+As In Place Archive stats are gathered they are written to a checkpoint file, `./archive-checkpoint.csv` by default. If a run is interrupted, re-run the same command with `-ResumeArchive $true` and only the mailboxes not already gathered will be queried:
+```
+./Get-RubrikM365SizingInfo.ps1 -ResumeArchive $true
+```
+The checkpoint is keyed by user principal name, so it is safe if the tenant's mailbox list changed between runs, and mailboxes that failed previously are retried on resume. A checkpoint written against a different tenant is refused. Use the same `-ArchiveCheckpointFilename` on both runs if you changed it from the default. Starting a fresh run when a checkpoint already exists renames the old one to `archive-checkpoint.csv.bak-<timestamp>` rather than deleting it.
+
 The script will try to gather stats for the Recoverable Items folder. This can also take awhile and timeout in larger environments. You can skip this by using:
 ```
 ./Get-RubrikM365SizingInfo.ps1 -SkipRecoverableItems $true
