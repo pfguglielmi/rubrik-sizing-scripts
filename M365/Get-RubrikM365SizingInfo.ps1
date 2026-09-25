@@ -1130,7 +1130,7 @@ if ($SkipArchiveMailbox -eq $true) {
   Write-Host "Now gathering In Place Archive usage" -foregroundcolor green
   Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
   Write-Host "Progress will be written as they are gathered" -foregroundcolor green
-  Write-Host "If this keeps timing out, run script with -SkipArchiveMailbox $true option" -foregroundcolor green
+  Write-Host "If this keeps timing out, run script with -SkipArchiveMailbox `$true option" -foregroundcolor green
   $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
   # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
   # $ActionRequiredPromptMessage = "Enter the User Principal Name"
@@ -1380,7 +1380,7 @@ if ($SkipRecoverableItems -eq $true) {
     Write-Host "Now gathering Recoverable Items usage" -foregroundcolor green
     Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
     Write-Host "Progress will be written as they are gathered" -foregroundcolor green
-    Write-Host "If this keeps timing out, run script with SkipRecoverableItems $true option" -foregroundcolor green
+    Write-Host "If this keeps timing out, run script with SkipRecoverableItems `$true option" -foregroundcolor green
     $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
     # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
     # $ActionRequiredPromptMessage = "Enter the User Principal Name"
