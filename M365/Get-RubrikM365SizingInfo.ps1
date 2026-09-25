@@ -1160,14 +1160,8 @@ if ($SkipArchiveMailbox -eq $true) {
   Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
   Write-Host "Progress will be written as they are gathered" -foregroundcolor green
   Write-Host "If this keeps timing out, run script with -SkipArchiveMailbox `$true option" -foregroundcolor green
-  $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
-  # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
-  # $ActionRequiredPromptMessage = "Enter the User Principal Name"
   $FirstInterval = 500
-  $SkipInternval = $FirstInterval
-  $ArchiveMailboxSizeGb = 0
-  $LargeAmountofArchiveMailboxCount = 5000
-  $FilterByField = 'User Principal Name'
+  $SkipInterval = $FirstInterval
   Write-Host "[INFO] Retrieving all Exchange Mailbox In-Place Archive sizing"
   # Get a list of all users with In Place Archive mailboxes in the tenant
   # $ArchiveMailboxes = Get-ExoMailbox -Archive -ResultSize Unlimited
@@ -1286,7 +1280,7 @@ if ($SkipArchiveMailbox -eq $true) {
         # very large tenants where the enumeration can take days. Counting processed mailboxes
         # rather than the loop index means a resume that skips thousands of completed users does
         # not fire pointless reconnects while making no EXO calls at all.
-        if ( ($ProcessedCount % $SkipInternval) -eq 0 ) {
+        if ( ($ProcessedCount % $SkipInterval) -eq 0 ) {
           Write-Host "[INFO] Refreshing Exchange Online connection at $CurrentMailboxNum / $ArchiveMailboxesCount to avoid token timeout."
           try { Reset-ExoConnection } catch {
             Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
@@ -1411,14 +1405,6 @@ if ($SkipRecoverableItems -eq $true) {
     Write-Host "This may take awhile since stats need to be gathered per user" -foregroundcolor green
     Write-Host "Progress will be written as they are gathered" -foregroundcolor green
     Write-Host "If this keeps timing out, run script with -SkipRecoverableItems `$true option" -foregroundcolor green
-    $ConnectionUserPrincipalName = $(Get-ConnectionInformation).UserPrincipalName
-    # $ActionRequiredLogMessage = "[ACTION REQUIRED] In order to periodically refresh the connection to Microsoft, we need the User Principal Name used during the authentication process."
-    # $ActionRequiredPromptMessage = "Enter the User Principal Name"
-    $FirstInterval = 500
-    $SkipInternval = $FirstInterval
-    $ArchiveMailboxSizeGb = 0
-    $LargeAmountofArchiveMailboxCount = 5000
-    $FilterByField = 'User Principal Name'
     Write-Host "[INFO] Retrieving all Exchange Mailbox Recoverable Items sizing"
 
     # Get a list of all users with Recoverable Items shared/non-shared mailboxes in the tenant
