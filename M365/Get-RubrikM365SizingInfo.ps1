@@ -1904,7 +1904,7 @@ $HTML_CODE = @"
                     </tr>
                     <tr>
                         <td>Archive Mailboxes</td>
-                        <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { $ExchangeDetails.'Archive Mailboxes' })</td>
+                        <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes Failed' -gt 0) { "$($ExchangeDetails.'Archive Mailboxes') of $($ExchangeDetails.'Archive Mailboxes Found') found" } else { $ExchangeDetails.'Archive Mailboxes' })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } else { $ExchangeDetails.'Archive Items' })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes' -like 'Skipped*') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Archive Storage Used' / 1GB / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
