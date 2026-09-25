@@ -1124,6 +1124,35 @@ function Read-ArchiveCheckpoint {
   return [PSCustomObject] @{ "Valid" = $true; "Completed" = $Map }
 }
 
+# Rewrite the checkpoint down to one row per mailbox before a resume reopens it for append.
+# Without this, a mailbox that fails on every resume gets a brand new row each time - growth
+# is failures x resumes rather than the (fixed) mailbox population - since failed rows are
+# retried and re-appended but never removed. Only $CompletedMap survives (its rows are already
+# unique per UserPrincipalName), so failed rows are dropped here; the retry this run will
+# either succeed and add a fresh OK row, or fail once more.
+function Compact-ArchiveCheckpoint {
+  param (
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [hashtable]$CompletedMap
+  )
+
+  $HeaderLine = Get-Content -Path $Path -Encoding UTF8 -TotalCount 1
+  $Writer = [System.IO.StreamWriter]::new($Path, $false, [System.Text.UTF8Encoding]::new($false))
+  try {
+    $Writer.WriteLine($HeaderLine)
+    $Writer.WriteLine("UserPrincipalName,ArchiveSize,ArchiveItems,Status,ErrorType")
+    foreach ($Completed in $CompletedMap.Values) {
+      $Writer.WriteLine("`"$($Completed.UserPrincipalName)`",$($Completed.ArchiveSize),$($Completed.ArchiveItems),OK,")
+    }
+  } finally {
+    $Writer.Flush()
+    $Writer.Dispose()
+  }
+}
+
 if ($SkipArchiveMailbox -eq $true) {
   Write-Host "Skipping gathering In Place Archive usage" -foregroundcolor green
 } else {
@@ -1187,6 +1216,7 @@ if ($SkipArchiveMailbox -eq $true) {
         if ($CompletedMap.ContainsKey($ResumeUser)) { [void]$ArchiveMailboxList.Add($CompletedMap[$ResumeUser]) }
       }
       Write-Host "[INFO] Resuming from checkpoint: $($ArchiveMailboxList.Count) of $ArchiveMailboxesCount mailboxes already gathered."
+      Compact-ArchiveCheckpoint -Path $CheckpointFullPath -CompletedMap $CompletedMap
     }
   } elseif (Test-Path -Path $CheckpointFullPath) {
     Move-ArchiveCheckpointAside -Path $CheckpointFullPath -Stamp $dateStringHH -Reason "Starting a new run. Use -ResumeArchive `$true to continue a previous one instead."
