@@ -73,6 +73,11 @@ Each In Place Archive mailbox is retried when a transient error such as throttli
 ./Get-RubrikM365SizingInfo.ps1 -ArchiveMaxAttempts 5 -ArchiveRetryDelaySeconds 10
 ```
 
+As In Place Archive stats are gathered they are written to a checkpoint file, `./archive-checkpoint.csv` by default. If a run is interrupted, re-run the same command with `-ResumeArchive $true` and only the mailboxes not already gathered will be queried:
+```
+./Get-RubrikM365SizingInfo.ps1 -ResumeArchive $true
+```
+The checkpoint is keyed by user principal name, so it is safe if the tenant's mailbox list changed between runs, and mailboxes that failed previously are retried on resume. A checkpoint written against a different tenant is refused. Use the same `-ArchiveCheckpointFilename` on both runs if you changed it from the default. Starting a fresh run when a checkpoint already exists renames the old one to `archive-checkpoint.csv.bak-<timestamp>` rather than deleting it.
 
 The script will try to gather stats for the Recoverable Items folder. This can also take awhile and timeout in larger environments. You can skip this by using:
 ```
