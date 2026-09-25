@@ -3,3 +3,8 @@ settings.json
 *.csv
 !/CLOUD/EXAMPLES/*
 CLOUD/*.json
+# Rotated archive checkpoints. The *.csv rule above does not cover these, because
+# rotation appends a timestamp after the extension.
+*.bak-*
+# Generated sizing reports. These contain a customer tenant's usage data.
+Rubrik-M365-Sizing-*.html
