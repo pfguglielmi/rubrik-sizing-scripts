@@ -24,6 +24,11 @@
     written to a checkpoint file as it is gathered so an interrupted run can be resumed
     with -ResumeArchive instead of starting over.
 
+    If the aggregate archive statistics call still fails after exhausting its retries, the
+    script falls back to rolling the mailbox's size up from its per-folder statistics instead -
+    a different EXO API path that can succeed when the aggregate call keeps timing out or being
+    throttled. Use -SkipArchiveFallback $true to disable this and only ever use the aggregate call.
+
     The M365 Usage Reports do not contain information on Exchange Recoverable Items Folder.
     By default, the script will try to gather this information by looping through
     every user and gathering that info directly. Unfortunately,
@@ -67,6 +72,9 @@
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ArchiveMaxAttempts 5 -ArchiveRetryDelaySeconds 10
     Retry each In Place Archive mailbox up to 5 times, starting with a 10 second backoff.
 
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -SkipArchiveFallback $true
+    Only ever use Get-EXOMailboxStatistics -Archive; never fall back to a per-folder rollup.
+
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ResumeRIF $true
     Resume Recoverable Items gathering from the checkpoint file left behind by an
     interrupted run, instead of gathering every mailbox again.
@@ -89,6 +97,9 @@
     Updated: 25/09/26
     By: Recoverable Items gathering made resilient the same way - retry with backoff,
         failure accounting, and checkpoint/resume.
+    Updated: 25/09/26
+    By: In Place Archive gathering falls back to a per-folder statistics rollup when the
+        aggregate archive statistics call still fails after exhausting its retries.
 #>
 
 [CmdletBinding()]
@@ -124,6 +135,14 @@ param (
     [Parameter()]
     [ValidateRange(0, 300)]
     [int]$ArchiveRetryDelaySeconds = 5,
+    # Skip the per-folder statistics rollup fallback and only ever use Get-EXOMailboxStatistics -Archive
+    [Parameter()]
+    [bool]$SkipArchiveFallback = $false,
+    # Number of attempts for the per-folder rollup fallback, used only after -ArchiveMaxAttempts
+    # is exhausted on the aggregate call (1 means no retry)
+    [Parameter()]
+    [ValidateRange(1, 10)]
+    [int]$ArchiveFallbackMaxAttempts = 2,
     # Resume In Place Archive gathering from the checkpoint file left by an interrupted run
     [Parameter()]
     [bool]$ResumeArchive = $false,
@@ -1095,9 +1114,15 @@ function Invoke-MailboxStatsWithRetry {
   return $Result
 }
 
-# Get In-Place Archive statistics for one mailbox. Thin wrapper: only the actual EXO call and
-# the archive-specific guarded parse live here, the retry/backoff/reconnect loop is shared via
-# Invoke-MailboxStatsWithRetry.
+# Get In-Place Archive statistics for one mailbox. Primary path: a single aggregate
+# Get-EXOMailboxStatistics -Archive call, retried via Invoke-MailboxStatsWithRetry exactly as
+# before. Fallback path: when the aggregate call still fails after exhausting -MaxAttempts, and
+# the failure isn't one where retrying anything is pointless (the archive genuinely doesn't exist
+# or isn't accessible), roll the size up from Get-MailboxFolderStatistics -Archive instead - one
+# row per archive folder rather than a single aggregate row, so heavier, but a different EXO API
+# path that can succeed when the aggregate call keeps timing out or being throttled. Reuses
+# ConvertFrom-ExoByteSizeString and Invoke-MailboxStatsWithRetry so neither the byte-size parsing
+# nor the retry/backoff/reconnect logic is duplicated here.
 function Get-ArchiveMailboxStats {
   param (
     [Parameter(Mandatory = $true)]
@@ -1113,8 +1138,16 @@ function Get-ArchiveMailboxStats {
     [bool]$AllowReconnect = $true,
 
     [Parameter()]
-    [bool]$ShowRetryDetail = $false
+    [bool]$ShowRetryDetail = $false,
+
+    [Parameter()]
+    [bool]$EnableFolderRollupFallback = $true,
+
+    [Parameter()]
+    [int]$FallbackMaxAttempts = 2
   )
+
+  $EmptyFields = [ordered]@{ ArchiveSize = [long]0; ArchiveItems = [long]0 }
 
   $FetchStats = {
     param($UserPrincipalName)
@@ -1141,9 +1174,75 @@ function Get-ArchiveMailboxStats {
     }
   }
 
-  return Invoke-MailboxStatsWithRetry -UserPrincipalName $UserPrincipalName -FetchStats $FetchStats `
-    -EmptyFields ([ordered]@{ ArchiveSize = [long]0; ArchiveItems = [long]0 }) `
-    -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds -AllowReconnect $AllowReconnect -ShowRetryDetail $ShowRetryDetail
+  $PrimaryResult = Invoke-MailboxStatsWithRetry -UserPrincipalName $UserPrincipalName -FetchStats $FetchStats `
+    -EmptyFields $EmptyFields -MaxAttempts $MaxAttempts -RetryDelaySeconds $RetryDelaySeconds `
+    -AllowReconnect $AllowReconnect -ShowRetryDetail $ShowRetryDetail
+
+  if ($PrimaryResult.Status -eq 'OK' -or -not $EnableFolderRollupFallback) { return $PrimaryResult }
+
+  # A permanent failure here (e.g. "archive isn't enabled") means the aggregate call already
+  # reached the mailbox and got a definitive answer - the folder rollup below would hit the exact
+  # same archive mailbox and fail identically, just burning an extra EXO call for no chance of a
+  # different outcome. Only fall back for failures that might be specific to the aggregate
+  # statistics path itself: timeouts, throttling, and other transient errors exhausted across
+  # every retry.
+  if ($PrimaryResult.ErrorType -match '^Permanent:') { return $PrimaryResult }
+
+  if ($ShowRetryDetail) {
+    Write-Host "[INFO] $UserPrincipalName archive stats failed after $($PrimaryResult.Attempts) attempt(s) ($($PrimaryResult.ErrorType)); falling back to per-folder rollup."
+  }
+
+  $FolderFetchStats = {
+    param($UserPrincipalName)
+
+    # No -FolderScope: unlike Get-RIFStatsForMailbox's Recoverable Items rollup, every folder in
+    # the archive mailbox has to be summed to reconstruct the mailbox's total size. Each row's
+    # FolderSize is that folder's own content only, not its subfolders', so summing every row
+    # double-counts nothing.
+    $FolderStats = @(Get-MailboxFolderStatistics -Identity $UserPrincipalName -Archive -ErrorAction Stop)
+
+    $ArchiveSize = [long]0
+    foreach ($Stats in $FolderStats) {
+      $ParsedSize = ConvertFrom-ExoByteSizeString -SizeString ([string]$Stats.FolderSize)
+      if ($null -eq $ParsedSize) {
+        return @{
+          Success = $false
+          ErrorType = 'UnparsableSize'
+          ErrorMessage = "Could not parse FolderSize for folder $($Stats.FolderPath)"
+        }
+      }
+      $ArchiveSize += $ParsedSize
+    }
+
+    return @{
+      Success = $true
+      Fields = @{
+        ArchiveSize = $ArchiveSize
+        ArchiveItems = [long]($FolderStats | Measure-Object -Property 'ItemsInFolder' -Sum).Sum
+      }
+    }
+  }
+
+  $FallbackResult = Invoke-MailboxStatsWithRetry -UserPrincipalName $UserPrincipalName -FetchStats $FolderFetchStats `
+    -EmptyFields $EmptyFields -MaxAttempts $FallbackMaxAttempts -RetryDelaySeconds $RetryDelaySeconds `
+    -AllowReconnect $AllowReconnect -ShowRetryDetail $ShowRetryDetail
+
+  if ($FallbackResult.Status -eq 'OK') {
+    if ($ShowRetryDetail) {
+      Write-Host "[INFO] $UserPrincipalName recovered archive size via per-folder rollup after the aggregate call failed."
+    }
+    return $FallbackResult
+  }
+
+  # Both paths failed. ErrorType is left as the aggregate call's own value (not folded together
+  # with the fallback's) because ArchiveFailures summarizes with 'Group-Object ErrorType' -
+  # combining the two into one string would fragment that grouping into a separate bucket per
+  # (aggregate error, fallback error) pair instead of the plain exception name operators already
+  # know how to read. The fallback outcome still shows up in ErrorMessage, which isn't grouped.
+  # ErrorMessage can't contain a comma: it's explicitly stripped of ',"\r\n' below.
+  $PrimaryResult.ErrorMessage = ("Aggregate: $($PrimaryResult.ErrorMessage) | FolderRollup also failed ($($FallbackResult.ErrorType)): $($FallbackResult.ErrorMessage)" -replace '[,"\r\n]', ' ')
+  if ($PrimaryResult.ErrorMessage.Length -gt 200) { $PrimaryResult.ErrorMessage = $PrimaryResult.ErrorMessage.Substring(0, 200) }
+  return $PrimaryResult
 }
 
 # Move an existing checkpoint out of the way instead of truncating or appending to it, so a
@@ -1667,12 +1766,21 @@ function Invoke-MailboxKindGathering {
 }
 
 # No .GetNewClosure() needed: this scriptblock is created fresh right here (not reused across
-# loop iterations), so it resolves $ArchiveRetryDelaySeconds/$EnableDebug via normal lexical
-# scoping to this block. GetNewClosure() binds to a new, isolated session state, which can fail
-# to resolve commands that aren't part of that fresh state.
+# loop iterations), so it resolves $ArchiveRetryDelaySeconds/$EnableDebug/$SkipArchiveFallback/
+# $ArchiveFallbackMaxAttempts via normal lexical scoping to this block. GetNewClosure() binds to a
+# new, isolated session state, which can fail to resolve commands that aren't part of that fresh
+# state.
 $GetArchiveStatsForMailbox = {
   param($Mailbox, $AttemptsForThisMailbox)
-  Get-ArchiveMailboxStats -UserPrincipalName $Mailbox.'User Principal Name' -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $ArchiveRetryDelaySeconds -ShowRetryDetail $EnableDebug
+  # Capped at $AttemptsForThisMailbox, not just $ArchiveFallbackMaxAttempts: when
+  # Invoke-MailboxStatsGathering's consecutive-failure breaker has tripped, it collapses
+  # $AttemptsForThisMailbox to 1 specifically so a tenant-wide outage gets one fast attempt per
+  # mailbox instead of a full backoff sequence. Without this cap the fallback would still run its
+  # own multi-attempt retry-with-backoff underneath that single-attempt primary call, reintroducing
+  # the exact per-mailbox stall the breaker exists to avoid.
+  $FallbackAttemptsForThisMailbox = [math]::Min($ArchiveFallbackMaxAttempts, $AttemptsForThisMailbox)
+  Get-ArchiveMailboxStats -UserPrincipalName $Mailbox.'User Principal Name' -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $ArchiveRetryDelaySeconds -ShowRetryDetail $EnableDebug `
+    -EnableFolderRollupFallback (-not $SkipArchiveFallback) -FallbackMaxAttempts $FallbackAttemptsForThisMailbox
 }
 
 $ArchiveKindConfig = @{
