@@ -755,11 +755,11 @@ $sharedMailboxStorageSumDisplay = [math]::Round($sharedMailboxStorageSum.Sum / $
 
 
 Write-Host "Total # of active user mailboxes - from usage report: $($ExchangeUsageReportUsers.count)" -foregroundcolor green
-Write-Host "Active users storage used (not including in-place archve, Recoverable Items Folder): $userMailboxStorageSumDisplay $capacityDisplay" -foregroundcolor green
-Write-Host "Active users item count (not including in-place archve, Recoverable Items Folder): $($userMailboxItems.sum)" -foregroundcolor green
+Write-Host "Active users storage used (not including in-place archive, Recoverable Items Folder): $userMailboxStorageSumDisplay $capacityDisplay" -foregroundcolor green
+Write-Host "Active users item count (not including in-place archive, Recoverable Items Folder): $($userMailboxItems.sum)" -foregroundcolor green
 Write-Host "Total # of active shared mailboxes - from usage report: $($ExchangeUsageReportShared.count)" -foregroundcolor green
 Write-Host "Shared mailboxes storage used: $sharedMailboxStorageSumDisplay $capacityDisplay" -foregroundcolor green
-Write-Host "Shared mailboxes item count (not including in-place archve, Recoverable Items Folder): $($sharedMailboxItems.sum)" -foregroundcolor green
+Write-Host "Shared mailboxes item count (not including in-place archive, Recoverable Items Folder): $($sharedMailboxItems.sum)" -foregroundcolor green
 Write-Host ""
 
 Write-Host "Getting historical Exchange storage growth" -foregroundcolor green
