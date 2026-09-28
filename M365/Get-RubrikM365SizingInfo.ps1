@@ -169,7 +169,8 @@
         is now ignored). App-auth tokens are refreshed ahead of their real expiry, a failed
         token refresh no longer falls through to an interactive login, and a circuit-breaker
         trip in parallel mode no longer disconnects every worker. Throttling is summarised on
-        the console and in the report.
+        the console and in the report. Graph report downloads give the Graph SDK more retry
+        room and retry the server errors it does not (500/502, retries exhausted).
 #>
 
 [CmdletBinding()]
@@ -355,6 +356,20 @@ $capacityDisplay = 'GB'
 
 Write-Host "Starting the Rubrik Microsoft 365 sizing script ($Version)."
 
+# Tune the Graph SDK's own retry handler. It already retries 429, 503 and 504 and honours
+# Retry-After, so the script does not; this only gives it more room than its defaults (3 retries,
+# 3 s) before it gives up with "Too many retries performed". The script makes about a dozen Graph
+# calls in total - the report downloads and a group lookup - so the Graph resource-unit budget is
+# nowhere near a limiting factor here; Exchange Online, not Graph, is what the per-mailbox passes
+# meet. Guarded because older Microsoft.Graph.Authentication versions lack the cmdlet.
+function Set-GraphRetryPolicy {
+  if (Get-Command -Name Set-MgRequestContext -ErrorAction SilentlyContinue) {
+    try { Set-MgRequestContext -MaxRetry 10 -RetryDelay 30 | Out-Null } catch {
+      Write-Host "[WARN] Could not adjust the Graph SDK retry settings: $($_.Exception.Message). Continuing with its defaults."
+    }
+  }
+}
+
 # Function to use Graph APIs to download report info
 Function Get-MgReport {
   [CmdletBinding()]
@@ -365,34 +380,50 @@ Function Get-MgReport {
     # Report Period (Days)
     [Parameter()]
     [ValidateSet("7", "30", "90", "180")]
-    [String]$Period
+    [String]$Period,
+    # Script-level attempts for the failures the Graph SDK does not retry itself: 500/502, and
+    # its own "Too many retries performed" once its retries (see Set-GraphRetryPolicy) run out.
+    # Kept small - each SDK attempt already contains up to 10 retries.
+    [Parameter()]
+    [int]$MaxAttempts = 2,
+    [Parameter()]
+    [int]$RetryDelaySeconds = 60
   )
-  try {
-    if ($reportName -eq 'getMailboxUsageDetail' -or $reportName -eq 'getMailboxUsageStorage') {
-      $graphApiVersion = "Beta"
-    } else {
-      $graphApiVersion = "Beta"
-    }
-    # Timestamped so re-running the script doesn't silently overwrite the previous run's raw
-    # data. $dateStringHH is the same stamp the HTML report carries, so every artifact produced
-    # by one run groups together. Join-Path rather than "$ExportFolder\..." - a hardcoded
-    # backslash is not a path separator on macOS/Linux PowerShell Core and would produce a
-    # single file with a backslash in its name once -ExportFolder is set to anything but '.'.
-    $OutputFilePath = Join-Path $ExportFolder "$ReportName-$dateStringHH.csv"
-    if ($Period -ne '') {
-      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)(period=`'D$($Period)`')" -OutputFilePath $OutputFilePath
-    } else {
-      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)" -OutputFilePath $OutputFilePath
-    }
-    return $OutputFilePath
+  if ($reportName -eq 'getMailboxUsageDetail' -or $reportName -eq 'getMailboxUsageStorage') {
+    $graphApiVersion = "Beta"
+  } else {
+    $graphApiVersion = "Beta"
   }
-  catch {
-    $errorMessage = $_.Exception | Out-String
-    if ($errorMessage.Contains('Response status code does not indicate success: Forbidden (Forbidden)')) {
-      Disconnect-MgGraph
-      throw "The user account used for authentication must have permissions covered by Reports Reader admin role."
+  # Timestamped so re-running the script doesn't silently overwrite the previous run's raw
+  # data. $dateStringHH is the same stamp the HTML report carries, so every artifact produced
+  # by one run groups together. Join-Path rather than "$ExportFolder\..." - a hardcoded
+  # backslash is not a path separator on macOS/Linux PowerShell Core and would produce a
+  # single file with a backslash in its name once -ExportFolder is set to anything but '.'.
+  $OutputFilePath = Join-Path $ExportFolder "$ReportName-$dateStringHH.csv"
+
+  for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+    try {
+      # A retry rewrites -OutputFilePath from the start, so a partial file left by a failed
+      # attempt is simply replaced.
+      if ($Period -ne '') {
+        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)(period=`'D$($Period)`')" -OutputFilePath $OutputFilePath
+      } else {
+        Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)" -OutputFilePath $OutputFilePath
+      }
+      return $OutputFilePath
     }
-    throw $_.Exception
+    catch {
+      $errorMessage = $_.Exception | Out-String
+      # Checked first, and never retried: a permissions problem does not fix itself.
+      if ($errorMessage.Contains('Response status code does not indicate success: Forbidden (Forbidden)')) {
+        Disconnect-MgGraph
+        throw "The user account used for authentication must have permissions covered by Reports Reader admin role."
+      }
+      $Retryable = $errorMessage -match '(?i)(InternalServerError|BadGateway|ServiceUnavailable|GatewayTimeout|Too many retries performed|HttpRequestException|\b50[0234]\b)'
+      if (-not $Retryable -or $Attempt -ge $MaxAttempts) { throw $_.Exception }
+      Write-Host "[WARN] Graph report $ReportName failed (attempt $Attempt of $MaxAttempts): $($_.Exception.Message). Retrying in $RetryDelaySeconds s." -foregroundcolor yellow
+      Start-Sleep -Seconds $RetryDelaySeconds
+    }
   }
 }
 
@@ -944,6 +975,7 @@ if ($UseAppAccess -eq $true) {
         Invoke-SizingCleanup
         return
     }
+    Set-GraphRetryPolicy
 
     if ($SkipArchiveMailbox -eq $false -or $SkipRecoverableItems -eq $false) {
         Write-Host "Connecting to the Microsoft Exchange Online Module to gather per-mailbox In Place Archive stats."
@@ -984,6 +1016,7 @@ if ($UseAppAccess -eq $true) {
         Invoke-SizingCleanup
         return
     }
+    Set-GraphRetryPolicy
 
     if ($SkipArchiveMailbox -eq $false -or $SkipRecoverableItems -eq $false) {
         Write-Host "Connecting to the Microsoft Exchange Online Module to gather per-mailbox In Place Archive stats."
