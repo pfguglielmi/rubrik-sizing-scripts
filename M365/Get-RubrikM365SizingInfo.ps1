@@ -215,6 +215,46 @@ param (
 
 )
 
+# Tear down both service connections. Safe to call at any point, including when neither was
+# ever established and when Disconnect-MgGraph has already run mid-script - each disconnect is
+# isolated so a failure in one still lets the other run, and neither can throw out of here.
+# Cleanup must never be the thing that masks the original error that triggered it.
+#
+# Defined before any other executable code in the script (rather than down near where it was
+# first needed) because 'trap' below is hoisted and applies to every statement above it too -
+# including the export-folder creation a few lines down, which can throw. A trap that runs
+# before this function is defined fails with "the term 'Invoke-SizingCleanup' is not
+# recognized", stacking a spurious error on top of the real one and skipping cleanup entirely.
+Function Invoke-SizingCleanup {
+  [CmdletBinding()]
+  param ()
+  try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+  try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+}
+
+# Guarantee the Graph and Exchange Online sessions are closed if the script dies part way
+# through. Without this a terminating error anywhere outside the handful of try/catch blocks -
+# the SharePoint section and the license math are both unwrapped - leaves live sessions and
+# tokens behind, which matters on multi-hour runs against large tenants.
+#
+# A script-scope trap rather than wrapping the body in try/finally: functions and executable
+# code are interleaved throughout this file, so there is no single span to wrap, and doing it
+# anyway would re-indent ~2400 lines for no behavioural gain. 'break' inside the trap stops the
+# script after cleanup runs, the same as an uncaught error would - but note this is a real
+# behaviour change for one class of error: a *statement-terminating* error (eg an unguarded
+# [int]::Parse or a bad array index) previously logged to the error stream and let the script
+# continue to the next statement, exiting 0; with this trap in place it now aborts the run and
+# exits non-zero. An unhandled *script-terminating* error (an explicit throw, or an error inside
+# a function that isn't caught) already aborted the run before this change, and still does -
+# for those, the error surfaced to the caller and the exit code are unchanged. Non-terminating
+# errors (the default for most cmdlets, eg a bare Disconnect-MgGraph failing) are not affected
+# either way; the trap never sees them.
+trap {
+  Write-Host "[ERROR] Unhandled error - closing Microsoft 365 connections before exiting." -foregroundcolor red
+  Invoke-SizingCleanup
+  break
+}
+
 $date = Get-Date
 $dateString = $date.ToString("yyyy-MM-dd")
 $dateStringHH = $date.ToString("yyyy-MM-dd_HHmm")
@@ -239,32 +279,6 @@ $outFilename = Join-Path $ExportFolder "Rubrik-M365-Sizing-$dateStringHH.html"
 $Version = "6.5"
 
 $ProgressPreference = 'SilentlyContinue'
-
-# Tear down both service connections. Safe to call at any point, including when neither was
-# ever established and when Disconnect-MgGraph has already run mid-script - each disconnect is
-# isolated so a failure in one still lets the other run, and neither can throw out of here.
-# Cleanup must never be the thing that masks the original error that triggered it.
-Function Invoke-SizingCleanup {
-  [CmdletBinding()]
-  param ()
-  try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
-  try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
-}
-
-# Guarantee the Graph and Exchange Online sessions are closed if the script dies part way
-# through. Without this a terminating error anywhere outside the handful of try/catch blocks -
-# the SharePoint section and the license math are both unwrapped - leaves live sessions and
-# tokens behind, which matters on multi-hour runs against large tenants.
-#
-# A script-scope trap rather than wrapping the body in try/finally: functions and executable
-# code are interleaved throughout this file, so there is no single span to wrap, and doing it
-# anyway would re-indent ~2400 lines for no behavioural gain. 'break' inside the trap re-throws
-# after cleanup, so the error surfaced to the caller and the exit code are unchanged.
-trap {
-  Write-Host "[ERROR] Unhandled error - closing Microsoft 365 connections before exiting." -foregroundcolor red
-  Invoke-SizingCleanup
-  break
-}
 
 # Define the capacity metric conversions
 $GB = 1000000000
@@ -802,7 +816,13 @@ Function Get-AzureAdGroupMemberUpn {
     [String]$CSVFilename,
     # Label used in console output, eg 'AD Group' or 'excluded AD Group'
     [Parameter()]
-    [String]$Label = 'AD Group'
+    [String]$Label = 'AD Group',
+    # An include group with 0 user members means "nothing to size" and should stop the run -
+    # but an exclude group with 0 user members means "exclude nobody", a legitimate, common
+    # state (a newly created group, or one that only ever held nested groups / service
+    # principals). Pass this for the exclude direction so it warns and returns @() instead.
+    [Parameter()]
+    [switch]$AllowEmpty
   )
 
   Write-Host "Looking up $Label users in: $GroupName" -foregroundcolor green
@@ -821,6 +841,13 @@ Function Get-AzureAdGroupMemberUpn {
     }
   }
   if ($MembersByUserPrincipalName.Count -eq 0) {
+    if ($AllowEmpty) {
+      Write-Host "[WARN] The Azure AD Group '$GroupName' does not contain any User Principal Names - nothing will be excluded." -foregroundcolor yellow
+      # Still write the (empty) CSV, so troubleshooting references to -CSVFilename elsewhere
+      # in the script point at a real, if empty, file rather than one that was never created.
+      $MembersByUserPrincipalName | Out-File -Path $CSVFilename
+      return @()
+    }
     throw "The Azure AD Group '$GroupName' does not contain any User Principal Names."
   }
   Write-Host "# of $Label members found: $($MembersByUserPrincipalName.Count)" -foregroundcolor green
@@ -839,7 +866,7 @@ if ($IncludeADGroupRequired) {
 }
 if ($ExcludeADGroupRequired) {
   $AzureAdExcludeGroupMembersByUserPrincipalName = Get-AzureAdGroupMemberUpn -GroupName $ExcludeADGroup `
-    -CSVFilename $ExcludeADGroupCSVFilename -Label 'excluded AD Group'
+    -CSVFilename $ExcludeADGroupCSVFilename -Label 'excluded AD Group' -AllowEmpty
 }
 
 if ($EnableDebug) {
@@ -893,8 +920,16 @@ $ExchangeUsageReportUsers = $ExchangeUsageReport | Where-Object { $_.'Is Deleted
 
 # List of all active (non-deleted) shared mailboxes
 if ($SkipSharedMailbox -eq $false) {
-  $ExchangeUsageReportShared = $ExchangeUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' -and
-    $_.'Recipient Type' -eq 'Shared'}
+  # @(...) matters here: an unwrapped Where-Object with zero matches returns $null rather than
+  # an empty array. Concatenating a real array with a variable holding that value does not
+  # introduce a phantom element in PowerShell 7.6 (Core) - verified empirically, since "+"
+  # treats a collapsed-empty-pipeline value differently from a literal $null, which DOES append
+  # as a trailing element. Wrapping here removes that version-dependent ambiguity outright and
+  # matches the @(...) pattern already used for $ExchangeUsageReportUsers a few lines below (in
+  # the AD Group filtering block), rather than relying on behaviour that isn't guaranteed across
+  # every PowerShell version this #requires 5.1+ script can run under.
+  $ExchangeUsageReportShared = @($ExchangeUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' -and
+    $_.'Recipient Type' -eq 'Shared'})
   $ExchangeActiveUsers = $ExchangeUsageReportUsers + $ExchangeUsageReportShared
 } else {
   $ExchangeUsageReportShared = @()
