@@ -53,9 +53,6 @@
     authenticate to M365 Graph APIs and Microsoft Exchange Module to pull usage
     information.
 
-    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -AnnualGrowth 35
-    Calculate sizing to include a 35% annual growth rate
-
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -SkipArchiveMailbox $true
     Skip gathering In Place Archive mailboxes.
 
@@ -84,6 +81,13 @@
 
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ADGroup <ad_group_name>
     Gather user info for only the AD Group specified.
+
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ExcludeADGroup <ad_group_name>
+    Gather user info for everyone except the members of the AD Group specified.
+
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ADGroup <include_group> -ExcludeADGroup <exclude_group>
+    Gather user info for members of <include_group> who are not also members of
+    <exclude_group>.
 .NOTES
     Author:         Chris Lumnah
     Created Date:   6/17/2021
@@ -100,15 +104,16 @@
     Updated: 25/09/26
     By: In Place Archive gathering falls back to a per-folder statistics rollup when the
         aggregate archive statistics call still fails after exhausting its retries.
+    Updated: 28/09/26
+    By: -ExcludeADGroup is now actually applied (it was accepted but ignored), AD Group
+        filtering now also scopes the Recoverable Items pass, -UseAppAccess is typed [bool],
+        and the unused -AnnualGrowth parameter was removed.
 #>
 
 [CmdletBinding()]
 param (
     [Parameter()]
     [bool]$EnableDebug = $false,
-    # Provide your estimated annual growth rate, eg '10' for 10%
-    [Parameter(HelpMessage="Estimated annual growth rate, eg 10 for 10%")]
-    [int]$AnnualGrowth,
     # Provide AD Group name if you only want to gather data for a specific AD Group
     [Parameter()]
     [String]$ADGroup,
@@ -118,6 +123,9 @@ param (
     # If gathering AD Group, CSV file to output AD Group membership info
     [Parameter()]
     [String]$ADGroupCSVFilename = './adgrouplist.csv',
+    # If excluding an AD Group, CSV file to output the excluded group's membership info
+    [Parameter()]
+    [String]$ExcludeADGroupCSVFilename = './adgroupexcludelist.csv',
     # Whether or not to skip gathering archived mailboxes, which can timeout
     [Parameter()]
     [bool]$SkipArchiveMailbox = $false,
@@ -170,7 +178,7 @@ param (
     # instead of delegated user access.
     [Parameter(HelpMessage="Set this to true when you want to access Exchange through
     App access instead of delegated user access.")]
-    [String]$UseAppAccess = $false
+    [bool]$UseAppAccess = $false
 
 )
 
@@ -199,10 +207,6 @@ $capacityMetric = $GB
 $capacityDisplay = 'GB'
 
 Write-Host "Starting the Rubrik Microsoft 365 sizing script ($Version)."
-
-if ($AnnualGrowth -eq '') {
-  $AnnualGrowth = 30
-}
 
 # Function to use Graph APIs to download report info
 Function Get-MgReport {
@@ -269,6 +273,12 @@ function Measure-AverageGrowth {
 
 # Function to solve for licenses required
 # Query M365Licsolver Azure Function
+#
+# NOTE: this function is currently dead code - it is defined but never called anywhere in the
+# script. As of 2026-09-28 the endpoint it targets (m365licsolver-azure.azurewebsites.net) no
+# longer resolves in DNS, so the Azure Function backing it appears to have been decommissioned.
+# It is kept here deliberately, unwired, pending a decision on whether to restore the service or
+# drop the feature. Do not call it without first confirming the endpoint is live again.
 function Solve-License {
   param (
     [Parameter(Mandatory)]
@@ -548,7 +558,9 @@ if ($exoModule.Version -lt $MinEXOModuleVersion) {
   throw "The 'ExchangeOnlineManagement' module is version $($exoModule.Version), but $MinEXOModuleVersion or later is required to avoid an MSAL broker mismatch. Run: Update-Module ExchangeOnlineManagement -Force, then start a fresh PowerShell session."
 }
 
-$AzureAdRequired = $PSBoundParameters.ContainsKey('ADGroup') -or $PSBoundParameters.ContainsKey('ExcludeADGroup')
+$IncludeADGroupRequired = $PSBoundParameters.ContainsKey('ADGroup')
+$ExcludeADGroupRequired = $PSBoundParameters.ContainsKey('ExcludeADGroup')
+$AzureAdRequired = $IncludeADGroupRequired -or $ExcludeADGroupRequired
 
 if ($AzureAdRequired) {
   # Validate the required 'Azure.Graph.Authentication' is installed
@@ -630,29 +642,58 @@ if ($UseAppAccess -eq $true) {
     }
 }
 
-# If AD Group is provided, get the AD Group membership info
-if ($AzureAdRequired) {
-  Write-Host "Looking up AD Group users in: $ADGroup" -foregroundcolor green
-  $AzureAdGroupDetails = Get-MgGroup -Filter "DisplayName eq '$ADGroup'"
-  if ($AzureAdGroupDetails.Count -eq 0) {
-    throw "The Azure AD Group '$ADGroup' does not exist. Exiting script."
+# Resolve one Azure AD group by display name to the list of User Principal Names it contains
+# (transitively, so nested groups are included). Used for both -ADGroup and -ExcludeADGroup, so
+# the two options behave identically apart from which direction they filter.
+Function Get-AzureAdGroupMemberUpn {
+  [CmdletBinding()]
+  param (
+    # Display name of the Azure AD group to resolve
+    [Parameter(Mandatory)]
+    [String]$GroupName,
+    # File to write the resolved user principal names to, for troubleshooting
+    [Parameter(Mandatory)]
+    [String]$CSVFilename,
+    # Label used in console output, eg 'AD Group' or 'excluded AD Group'
+    [Parameter()]
+    [String]$Label = 'AD Group'
+  )
+
+  Write-Host "Looking up $Label users in: $GroupName" -foregroundcolor green
+  $GroupDetails = Get-MgGroup -Filter "DisplayName eq '$GroupName'"
+  if ($GroupDetails.Count -eq 0) {
+    throw "The Azure AD Group '$GroupName' does not exist. Exiting script."
   }
-  $AzureAdGroupMembersById = Get-MgGroupTransitiveMember -GroupId $AzureAdGroupDetails.Id -All
+  $MembersById = Get-MgGroupTransitiveMember -GroupId $GroupDetails.Id -All
   if ($EnableDebug) {
-    Write-Host "[DEBUG] Azure AD Group Members Size: $($AzureAdGroupMembersById.Count)"
+    Write-Host "[DEBUG] Azure AD Group '$GroupName' Members Size: $($MembersById.Count)"
   }
-  $AzureAdGroupMembersByUserPrincipalName = @()
-  $AzureAdGroupMembersById | Foreach-Object {
+  $MembersByUserPrincipalName = @()
+  $MembersById | Foreach-Object {
     if ($_.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.user") {
-      $AzureAdGroupMembersByUserPrincipalName += $_.AdditionalProperties["userPrincipalName"]
+      $MembersByUserPrincipalName += $_.AdditionalProperties["userPrincipalName"]
     }
   }
-  if ($AzureAdGroupMembersByUserPrincipalName.Count -eq 0) {
-    throw "The Azure AD Group '$ADGroup' does not contain any User Principal Names."
+  if ($MembersByUserPrincipalName.Count -eq 0) {
+    throw "The Azure AD Group '$GroupName' does not contain any User Principal Names."
   }
-  Write-Host "# of Azure AD Group members found: $($AzureAdGroupMembersByUserPrincipalName.Count)" -foregroundcolor green
-  Write-Host "AD Group user principal names exported to CSV: $ADGroupCSVFilename" -foregroundcolor green
-  $AzureAdGroupMembersByUserPrincipalName | Out-File -Path $ADGroupCSVFilename
+  Write-Host "# of $Label members found: $($MembersByUserPrincipalName.Count)" -foregroundcolor green
+  Write-Host "$Label user principal names exported to CSV: $CSVFilename" -foregroundcolor green
+  $MembersByUserPrincipalName | Out-File -Path $CSVFilename
+  return $MembersByUserPrincipalName
+}
+
+# If an AD Group is provided to include and/or exclude, resolve each one's membership now.
+# Each is resolved independently, so -ExcludeADGroup works on its own, not only alongside -ADGroup.
+$AzureAdGroupMembersByUserPrincipalName = $null
+$AzureAdExcludeGroupMembersByUserPrincipalName = $null
+if ($IncludeADGroupRequired) {
+  $AzureAdGroupMembersByUserPrincipalName = Get-AzureAdGroupMemberUpn -GroupName $ADGroup `
+    -CSVFilename $ADGroupCSVFilename -Label 'AD Group'
+}
+if ($ExcludeADGroupRequired) {
+  $AzureAdExcludeGroupMembersByUserPrincipalName = Get-AzureAdGroupMemberUpn -GroupName $ExcludeADGroup `
+    -CSVFilename $ExcludeADGroupCSVFilename -Label 'excluded AD Group'
 }
 
 if ($EnableDebug) {
@@ -715,24 +756,42 @@ if ($SkipSharedMailbox -eq $false) {
 }
 
 if ($AzureAdRequired) {
-  if ($ADGroup -ne '') {
-    Write-Host "Filtering user mailboxes by Azure AD Group: $ADGroup"
-  } else {
-
-  }
   $FilterByField = "User Principal Name"
-  $ExchangeUsageReportUsers = $ExchangeUsageReportUsers | Where-Object { $_.$FilterByField -in $AzureAdGroupMembersByUserPrincipalName }
+  if ($IncludeADGroupRequired) {
+    Write-Host "Filtering user mailboxes by Azure AD Group: $ADGroup"
+    $ExchangeUsageReportUsers = @($ExchangeUsageReportUsers | Where-Object { $_.$FilterByField -in $AzureAdGroupMembersByUserPrincipalName })
+  }
+  if ($ExcludeADGroupRequired) {
+    Write-Host "Excluding user mailboxes in Azure AD Group: $ExcludeADGroup"
+    $ExchangeUsageReportUsers = @($ExchangeUsageReportUsers | Where-Object { $_.$FilterByField -notin $AzureAdExcludeGroupMembersByUserPrincipalName })
+  }
   # If we didn't get any usage for the Azure AD group users, it might be because the reports are masking User IDs
   if ($ExchangeUsageReportUsers.count -eq 0) {
-    Write-Host "[ERROR] Did not match any Azure AD Group users to the usage reports" -foregroundcolor red
-    Write-Host "[ERROR] Check the Azure AD group csv ($ADGroupCSVFilename) to see what users are part of the Azure AD Group" -foregroundcolor red
+    if ($IncludeADGroupRequired) {
+      Write-Host "[ERROR] Did not match any Azure AD Group users to the usage reports" -foregroundcolor red
+      Write-Host "[ERROR] Check the Azure AD group csv ($ADGroupCSVFilename) to see what users are part of the Azure AD Group" -foregroundcolor red
+    } else {
+      Write-Host "[ERROR] Excluding Azure AD Group '$ExcludeADGroup' removed every user mailbox from the usage reports" -foregroundcolor red
+      Write-Host "[ERROR] Check the excluded Azure AD group csv ($ExcludeADGroupCSVFilename) to see what users are part of that group" -foregroundcolor red
+    }
     Write-Host "[ERROR] Check the mailbox csv ($reportCSV) to see if 'User Principal Name' are being masked" -foregroundcolor red
     Write-Host "[ERROR] Un-mask by going to M365 Admin Center -> Settings -> Org Settings -> Services"  -foregroundcolor red
     Write-Host "[ERROR] Then click on Reports and clear: Display concealed user, group, and site names in all reports, and then select Save"  -foregroundcolor red
     Write-Host "[ERROR] See: https://learn.microsoft.com/en-us/microsoft-365/troubleshoot/miscellaneous/reports-show-anonymous-user-name" -foregroundcolor red
     throw "Error running script with Azure AD group option - could not find any matching users. Exiting script."
   }
-  Write-Host "Matched $($ExchangeUsageReportUsers.count) users in the provided Azure AD Group" -foregroundcolor green
+  Write-Host "Matched $($ExchangeUsageReportUsers.count) user mailboxes after Azure AD Group filtering" -foregroundcolor green
+
+  # $ExchangeActiveUsers was built above from the unfiltered user population, so it has to be
+  # rebuilt here - otherwise the Recoverable Items pass (which walks $ExchangeActiveUsers, one or
+  # more Exchange Online calls per mailbox) would ignore the AD Group filter entirely and scan the
+  # whole tenant. Shared mailboxes are intentionally not filtered: they have no AD Group
+  # membership of their own, matching how the include filter has always scoped itself.
+  if ($SkipSharedMailbox -eq $false) {
+    $ExchangeActiveUsers = $ExchangeUsageReportUsers + $ExchangeUsageReportShared
+  } else {
+    $ExchangeActiveUsers = $ExchangeUsageReportUsers
+  }
 }
 
 # Calculate metrics for user mailboxes
@@ -824,20 +883,31 @@ Write-Host ""
 $OneDriveUsageReportAccounts = $OneDriveUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' }
 
 if ($AzureAdRequired) {
-  Write-Host "Filtering user accounts by Azure AD Group: $ADGroup"
   $FilterByField = "Owner Principal Name"
-  $OneDriveUsageReportAccounts = $OneDriveUsageReportAccounts | Where-Object { $_.$FilterByField -in $AzureAdGroupMembersByUserPrincipalName }
+  if ($IncludeADGroupRequired) {
+    Write-Host "Filtering user accounts by Azure AD Group: $ADGroup"
+    $OneDriveUsageReportAccounts = @($OneDriveUsageReportAccounts | Where-Object { $_.$FilterByField -in $AzureAdGroupMembersByUserPrincipalName })
+  }
+  if ($ExcludeADGroupRequired) {
+    Write-Host "Excluding user accounts in Azure AD Group: $ExcludeADGroup"
+    $OneDriveUsageReportAccounts = @($OneDriveUsageReportAccounts | Where-Object { $_.$FilterByField -notin $AzureAdExcludeGroupMembersByUserPrincipalName })
+  }
   # If we didn't get any usage for the Azure AD group users, it might be because the reports are masking User IDs
   if ($OneDriveUsageReportAccounts.count -eq 0) {
-    Write-Host "[ERROR] Did not match any Azure AD Group users to the usage reports" -foregroundcolor red
-    Write-Host "[ERROR] Check the Azure AD group csv ($ADGroupCSVFilename) to see what users are part of the Azure AD Group" -foregroundcolor red
+    if ($IncludeADGroupRequired) {
+      Write-Host "[ERROR] Did not match any Azure AD Group users to the usage reports" -foregroundcolor red
+      Write-Host "[ERROR] Check the Azure AD group csv ($ADGroupCSVFilename) to see what users are part of the Azure AD Group" -foregroundcolor red
+    } else {
+      Write-Host "[ERROR] Excluding Azure AD Group '$ExcludeADGroup' removed every OneDrive account from the usage reports" -foregroundcolor red
+      Write-Host "[ERROR] Check the excluded Azure AD group csv ($ExcludeADGroupCSVFilename) to see what users are part of that group" -foregroundcolor red
+    }
     Write-Host "[ERROR] Check the OneDrive csv ($reportCSV) to see if 'Owner Principal Name' are being masked" -foregroundcolor red
     Write-Host "[ERROR] Un-mask by going to M365 Admin Center -> Settings -> Org Settings -> Services"  -foregroundcolor red
     Write-Host "[ERROR] Then click on Reports and clear: Display concealed user, group, and site names in all reports, and then select Save"  -foregroundcolor red
     Write-Host "[ERROR] See: https://learn.microsoft.com/en-us/microsoft-365/troubleshoot/miscellaneous/reports-show-anonymous-user-name" -foregroundcolor red
     throw "Error running script with Azure AD group option - could not find any matching users. Exiting script."
   }
-  Write-Host "Matched $($OneDriveUsageReportAccounts.count) users in the provided Azure AD Group" -foregroundcolor green
+  Write-Host "Matched $($OneDriveUsageReportAccounts.count) OneDrive accounts after Azure AD Group filtering" -foregroundcolor green
 }
 
 # Calculate metrics for OneDrive accounts
