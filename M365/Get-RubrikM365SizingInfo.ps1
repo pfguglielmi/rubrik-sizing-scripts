@@ -79,6 +79,16 @@
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -RIFMaxAttempts 5 -RIFRetryDelaySeconds 10
     Retry each Recoverable Items mailbox up to 5 times, starting with a 10 second backoff.
 
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ExportFolder 'D:\M365Sizing'
+    Write the report CSVs, the HTML report and any failure CSVs to the folder specified,
+    creating it if it does not exist. Checkpoint and AD Group CSVs are unaffected - those
+    have their own -*Filename parameters.
+
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ReconnectInterval 1000 -ConsecutiveFailureLimit 50
+    Refresh the Exchange Online connection every 1000 mailboxes instead of every 500, and
+    allow 50 consecutive mailbox failures before the circuit breaker stops retrying. Useful
+    on very large or historically noisy tenants.
+
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ADGroup <ad_group_name>
     Gather user info for only the AD Group specified.
 
@@ -108,6 +118,13 @@
     By: -ExcludeADGroup is now actually applied (it was accepted but ignored), AD Group
         filtering now also scopes the Recoverable Items pass, -UseAppAccess is typed [bool],
         and the unused -AnnualGrowth parameter was removed.
+    Updated: 28/09/26
+    By: Hardening for long runs - per-object averages and growth calculations guard against
+        empty populations instead of rendering Infinity/NaN, report CSVs are timestamped so
+        re-runs no longer overwrite them, output paths use Join-Path (a hardcoded backslash
+        was broken on macOS/Linux), -ExportFolder / -ConsecutiveFailureLimit /
+        -ReconnectInterval are now parameters, and Graph and Exchange Online sessions are
+        closed on any exit path.
 #>
 
 [CmdletBinding()]
@@ -174,6 +191,22 @@ param (
     # Number of days to get historical stats for: 7, 30, 90, 180
     [Parameter()]
     [Int]$Period = 180,
+    # Folder to write the report CSVs, the HTML report and any failure CSVs to. Created if it
+    # does not exist. Does not affect the checkpoint or AD Group CSVs - those have their own
+    # -*Filename parameters and are used verbatim, so a -Resume run always looks exactly where
+    # the interrupted run wrote.
+    [Parameter()]
+    [String]$ExportFolder = '.',
+    # Number of consecutive mailbox failures before the circuit breaker stops retrying and falls
+    # back to a single attempt per mailbox for the rest of the run
+    [Parameter()]
+    [ValidateRange(1, 10000)]
+    [int]$ConsecutiveFailureLimit = 25,
+    # Refresh the Exchange Online connection every N mailboxes processed, to stay ahead of token
+    # expiry on long runs. Raise it to reduce reconnect churn on a healthy tenant.
+    [Parameter()]
+    [ValidateRange(1, 100000)]
+    [int]$ReconnectInterval = 500,
     # UseAppAccess indicates that the user wants to access Exchange through App access
     # instead of delegated user access.
     [Parameter(HelpMessage="Set this to true when you want to access Exchange through
@@ -186,15 +219,52 @@ $date = Get-Date
 $dateString = $date.ToString("yyyy-MM-dd")
 $dateStringHH = $date.ToString("yyyy-MM-dd_HHmm")
 
-# Filename to export the html report to
-$outFilename = "./Rubrik-M365-Sizing-$dateStringHH.html"
+# Create the export folder up front rather than letting the first write fail deep into a long
+# run. Resolve it to an absolute path so nothing downstream depends on the working directory
+# staying put for the duration of the run.
+if (-not (Test-Path -LiteralPath $ExportFolder)) {
+  try {
+    New-Item -Path $ExportFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    Write-Host "Created export folder: $ExportFolder" -foregroundcolor green
+  }
+  catch {
+    throw "Could not create the export folder '$ExportFolder': $($_.Exception.Message)"
+  }
+}
+$ExportFolder = (Resolve-Path -LiteralPath $ExportFolder).ProviderPath
 
-# Folder to export CSVs to
-$ExportFolder = '.'
+# Filename to export the html report to
+$outFilename = Join-Path $ExportFolder "Rubrik-M365-Sizing-$dateStringHH.html"
 
 $Version = "6.5"
 
 $ProgressPreference = 'SilentlyContinue'
+
+# Tear down both service connections. Safe to call at any point, including when neither was
+# ever established and when Disconnect-MgGraph has already run mid-script - each disconnect is
+# isolated so a failure in one still lets the other run, and neither can throw out of here.
+# Cleanup must never be the thing that masks the original error that triggered it.
+Function Invoke-SizingCleanup {
+  [CmdletBinding()]
+  param ()
+  try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+  try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+}
+
+# Guarantee the Graph and Exchange Online sessions are closed if the script dies part way
+# through. Without this a terminating error anywhere outside the handful of try/catch blocks -
+# the SharePoint section and the license math are both unwrapped - leaves live sessions and
+# tokens behind, which matters on multi-hour runs against large tenants.
+#
+# A script-scope trap rather than wrapping the body in try/finally: functions and executable
+# code are interleaved throughout this file, so there is no single span to wrap, and doing it
+# anyway would re-indent ~2400 lines for no behavioural gain. 'break' inside the trap re-throws
+# after cleanup, so the error surfaced to the caller and the exit code are unchanged.
+trap {
+  Write-Host "[ERROR] Unhandled error - closing Microsoft 365 connections before exiting." -foregroundcolor red
+  Invoke-SizingCleanup
+  break
+}
 
 # Define the capacity metric conversions
 $GB = 1000000000
@@ -226,12 +296,18 @@ Function Get-MgReport {
     } else {
       $graphApiVersion = "Beta"
     }
+    # Timestamped so re-running the script doesn't silently overwrite the previous run's raw
+    # data. $dateStringHH is the same stamp the HTML report carries, so every artifact produced
+    # by one run groups together. Join-Path rather than "$ExportFolder\..." - a hardcoded
+    # backslash is not a path separator on macOS/Linux PowerShell Core and would produce a
+    # single file with a backslash in its name once -ExportFolder is set to anything but '.'.
+    $OutputFilePath = Join-Path $ExportFolder "$ReportName-$dateStringHH.csv"
     if ($Period -ne '') {
-      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)(period=`'D$($Period)`')" -OutputFilePath "$ExportFolder\$ReportName.csv"
+      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)(period=`'D$($Period)`')" -OutputFilePath $OutputFilePath
     } else {
-      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)" -OutputFilePath "$ExportFolder\$ReportName.csv"
+      Invoke-MgGraphRequest -Uri "https://graph.microsoft.com/$($graphApiVersion)/reports/$($ReportName)" -OutputFilePath $OutputFilePath
     }
-    return "$ExportFolder\$ReportName.csv"
+    return $OutputFilePath
   }
   catch {
     $errorMessage = $_.Exception | Out-String
@@ -254,20 +330,84 @@ function Measure-AverageGrowth {
     [Parameter(Mandatory)]
     [string]$ReportName
   )
-  $UsageReport = Import-Csv -Path $ReportCSV | Sort-Object -Property "Report Date" -Descending
+  $UsageReport = @(Import-Csv -Path $ReportCSV | Sort-Object -Property "Report Date" -Descending)
+
+  # A workload with no report rows at all - Graph returned an empty CSV. Everything below would
+  # dereference $UsageReport[0] on $null, so bail out with a measurable-nothing result.
+  if ($UsageReport.Count -eq 0) {
+    Write-Host "$ReportName historical storage usage:"
+    Write-Host "  - N/A (no report data returned)"
+    return 0
+  }
+
   $ReportDays = $UsageReport[0].'Report Period'
   $LatestUsageGB = [math]::Round($UsageReport[0].'Storage Used (Byte)' / $capacityMetric, 2)
   $EarliestUsageGB = [math]::Round($UsageReport[-1].'Storage Used (Byte)' / $capacityMetric, 2)
   $GrowthOverPeriod = [math]::Round($LatestUsageGB - $EarliestUsageGB, 2)
-  $AvgGrowthPerDay = $GrowthOverPeriod / $ReportDays
+
+  # Both of the divisions below have denominators that are legitimately zero in real tenants:
+  # 'Report Period' can come back empty or 0 from Graph, and $LatestUsageGB is 0 for a workload
+  # with no content yet (a new tenant, or a customer not using SharePoint at all). Unguarded
+  # these produce Infinity/NaN, or throw, and the result is reported as if it were measured.
+  $ReportDaysValue = 0
+  [void][int]::TryParse([string]$ReportDays, [ref]$ReportDaysValue)
+  if ($ReportDaysValue -le 0) {
+    Write-Host "$ReportName historical storage usage:"
+    Write-Host "  - N/A (report period is 0 days)"
+    return 0
+  }
+
+  $AvgGrowthPerDay = $GrowthOverPeriod / $ReportDaysValue
   $GrowthPerYearGB = [math]::Round($AvgGrowthPerDay * 365, 2)
-  $GrowthPerYearPct = [math]::Round($GrowthPerYearGB / $LatestUsageGB, 2)
+
   Write-Host "$ReportName historical storage usage:"
   Write-Host "  - Usage on $($UsageReport[0].'Report Date'): $LatestUsageGB $capacityDisplay"
   Write-Host "  - Usage on $($UsageReport[-1].'Report Date'): $EarliestUsageGB $capacityDisplay"
-  Write-Host "  - Growth over $ReportDays days: $GrowthOverPeriod $capacityDisplay"
+  Write-Host "  - Growth over $ReportDaysValue days: $GrowthOverPeriod $capacityDisplay"
+
+  if ($LatestUsageGB -le 0) {
+    # Growth as a percentage of nothing is undefined, not 0%. The absolute figure is still
+    # meaningful and worth printing.
+    Write-Host "  - Growth annualized per year: $GrowthPerYearGB $capacityDisplay, N/A (0 $capacityDisplay in use)"
+    return 0
+  }
+
+  $GrowthPerYearPct = [math]::Round($GrowthPerYearGB / $LatestUsageGB, 2)
   Write-Host "  - Growth annualized per year: $GrowthPerYearGB $capacityDisplay, $($GrowthPerYearPct * 100)%"
   return $GrowthPerYearPct
+}
+
+# Format a "per object" average for the HTML report. An average over zero objects is undefined,
+# not zero, so report it as such rather than printing a 0 the reader cannot distinguish from a
+# genuinely tiny measurement - or, worse, letting PowerShell render Infinity/NaN into a
+# customer-facing table. Every "Per X Size" cell in the report goes through this.
+Function Format-PerObjectAverage {
+  [CmdletBinding()]
+  param (
+    # Total to average, in bytes (or already-converted units when -Divisor is left at 1)
+    [Parameter()]
+    [double]$Total,
+    # Number of objects to divide by. Accepted loosely: comes straight off the details objects,
+    # where it may be a string, $null, or absent.
+    [Parameter()]
+    [object]$Count,
+    # Plural noun for the "N/A (0 <label>)" message, eg 'mailboxes', 'accounts', 'sites'
+    [Parameter(Mandatory)]
+    [string]$ObjectLabel,
+    # Unit conversion applied before dividing by $Count, normally $capacityMetric. Left at 1 for
+    # totals that are already in display units.
+    [Parameter()]
+    [double]$Divisor = 1
+  )
+  $CountValue = 0
+  [void][int]::TryParse([string]$Count, [ref]$CountValue)
+  if ($CountValue -le 0) {
+    return "N/A (0 $ObjectLabel)"
+  }
+  if ($Divisor -le 0) {
+    return "N/A (0 $ObjectLabel)"
+  }
+  return [math]::Round($Total / $Divisor / $CountValue, 2)
 }
 
 
@@ -587,6 +727,7 @@ if ($UseAppAccess -eq $true) {
         $errorException = $_.Exception
         $errorMessage = $errorException.Message
         Write-Host "[ERROR] Unable to Connect to the Microsoft Graph PowerShell Module: $errorMessage"
+        Invoke-SizingCleanup
         return
     }
 
@@ -608,6 +749,8 @@ if ($UseAppAccess -eq $true) {
             }
             $errorMessage = $_.Exception.Message
             Write-Host "[ERROR] Unable to Connect to the Microsoft Exchange PowerShell Module: $errorMessage"
+            # Graph connected successfully above; without this it would be left open.
+            Invoke-SizingCleanup
             return
         }
     }
@@ -622,6 +765,7 @@ if ($UseAppAccess -eq $true) {
         $errorException = $_.Exception
         $errorMessage = $errorException.Message
         Write-Host "[ERROR] Unable to Connect to the Microsoft Graph PowerShell Module: $errorMessage"
+        Invoke-SizingCleanup
         return
     }
 
@@ -637,6 +781,8 @@ if ($UseAppAccess -eq $true) {
             }
             $errorMessage = $_.Exception.Message
             Write-Host "[ERROR] Unable to Connect to the Microsoft Exchange PowerShell Module: $errorMessage"
+            # Graph connected successfully above; without this it would be left open.
+            Invoke-SizingCleanup
             return
         }
     }
@@ -1718,7 +1864,7 @@ function Invoke-MailboxStatsGathering {
     $FailedList | Group-Object ErrorType | Sort-Object Count -Descending | ForEach-Object {
       Write-Host "         $($_.Count) x $($_.Name)"
     }
-    $FailureCSV = "$ExportFolder\$FailureCsvPrefix-$DateStamp.csv"
+    $FailureCSV = Join-Path $ExportFolder "$FailureCsvPrefix-$DateStamp.csv"
     $FailedList | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $FailureCSV -Encoding UTF8
     Write-Host "[WARN] Full failure list written to: $FailureCSV" -foregroundcolor yellow
     Write-Host "[WARN] Re-run with -$ResumeParamName `$true to retry just the mailboxes that failed." -foregroundcolor yellow
@@ -1791,7 +1937,14 @@ function Invoke-MailboxKindGathering {
     [string]$CapacityDisplay,
 
     [Parameter(Mandatory = $true)]
-    [PSCustomObject]$ExchangeDetails
+    [PSCustomObject]$ExchangeDetails,
+
+    # Passed straight through to Invoke-MailboxStatsGathering; see its param block.
+    [Parameter()]
+    [int]$ConsecutiveFailureLimit = 25,
+
+    [Parameter()]
+    [int]$ReconnectInterval = 500
   )
 
   $Kind = $KindConfig.Kind
@@ -1823,7 +1976,8 @@ function Invoke-MailboxKindGathering {
     -CheckpointFilenameParamName $KindConfig.CheckpointFilenameParamName -ResumeParamName $KindConfig.ResumeParamName -Resume $Resume `
     -MaxAttempts $MaxAttempts -FailureCsvPrefix $KindConfig.FailureCsvPrefix `
     -ExportFolder $ExportFolder -DateStamp $DateStamp -ScriptVersion $ScriptVersion `
-    -CapacityMetric $CapacityMetric -CapacityDisplay $CapacityDisplay
+    -CapacityMetric $CapacityMetric -CapacityDisplay $CapacityDisplay `
+    -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
 
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name $PropertyPrefix -Value $Gathering.SucceededCount
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name "$PropertyPrefix Found" -Value $Gathering.PopulationCount
@@ -1867,7 +2021,8 @@ $ArchiveGathering = Invoke-MailboxKindGathering -KindConfig $ArchiveKindConfig -
   -Population $ArchiveMailboxes -GetStatsForMailbox $GetArchiveStatsForMailbox `
   -CheckpointFilename $ArchiveCheckpointFilename -Resume $ResumeArchive -MaxAttempts $ArchiveMaxAttempts `
   -ExportFolder $ExportFolder -DateStamp $dateStringHH -ScriptVersion $Version `
-  -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails
+  -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails `
+  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
 
 if ($null -ne $ArchiveGathering) {
   # 'Archive Mailboxes' is the count actually read, not the population: it is the denominator of
@@ -1921,7 +2076,8 @@ $RIFGathering = Invoke-MailboxKindGathering -KindConfig $RIFKindConfig -SkipFlag
   -Population $RIFMailboxes -GetStatsForMailbox $GetRIFStatsForMailbox `
   -CheckpointFilename $RIFCheckpointFilename -Resume $ResumeRIF -MaxAttempts $RIFMaxAttempts `
   -ExportFolder $ExportFolder -DateStamp $dateStringHH -ScriptVersion $Version `
-  -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails
+  -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails `
+  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
 
 if ($null -ne $RIFGathering) {
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Recoverable Items Used' -Value $RIFGathering.ConvertedSize
@@ -2381,35 +2537,35 @@ $HTML_CODE = @"
                         <td>$($ExchangeDetails.'User Mailboxes')</td>
                         <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / $capacityMetric, 2))</td>
                         <td>$($ExchangeDetails.'User Items No Archive')</td>
-                        <td>$([math]::round($ExchangeDetails.'User Storage Used No Archive' / $capacityMetric / $ExchangeDetails.'User Mailboxes', 2))</td>
+                        <td>$(Format-PerObjectAverage -Total $ExchangeDetails.'User Storage Used No Archive' -Count $ExchangeDetails.'User Mailboxes' -Divisor $capacityMetric -ObjectLabel 'mailboxes')</td>
                     </tr>
                     <tr>
                         <td>Shared Mailboxes</td>
                         <td>$($ExchangeDetails.'Shared Mailboxes')</td>
                         <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / $capacityMetric, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { $ExchangeDetails.'Shared Items No Archive' })</td>
-                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Shared Storage Used No Archive' / $capacityMetric / $ExchangeDetails.'Shared Mailboxes', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Shared Mailboxes' -eq 'Skipped') { 'Skipped' } else { Format-PerObjectAverage -Total $ExchangeDetails.'Shared Storage Used No Archive' -Count $ExchangeDetails.'Shared Mailboxes' -Divisor $capacityMetric -ObjectLabel 'shared mailboxes' })</td>
                     </tr>
                     <tr>
                         <td>Archive Mailboxes</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes Failed' -gt 0) { "$($ExchangeDetails.'Archive Mailboxes') of $($ExchangeDetails.'Archive Mailboxes Found') found" } else { $ExchangeDetails.'Archive Mailboxes' })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { [math]::round($ExchangeDetails.'Archive Storage Used' / $capacityMetric, 2) })</td>
                         <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { $ExchangeDetails.'Archive Items' })</td>
-                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Archive Mailboxes' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Archive Storage Used' / $capacityMetric / $ExchangeDetails.'Archive Mailboxes', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Archive Mailboxes Skipped') { 'Skipped' } else { Format-PerObjectAverage -Total $ExchangeDetails.'Archive Storage Used' -Count $ExchangeDetails.'Archive Mailboxes' -Divisor $capacityMetric -ObjectLabel 'archive mailboxes' })</td>
                     </tr>
                     <tr>
                         <td>Recoverable Items</td>
                         <td>$(if ($ExchangeDetails.'Recoverable Items Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Recoverable Items Failed' -gt 0) { "$($ExchangeDetails.'Recoverable Items') of $($ExchangeDetails.'Recoverable Items Found') found" } else { $ExchangeDetails.'Recoverable Items' })</td>
                         <td>$(if ($ExchangeDetails.'Recoverable Items Skipped') { 'Skipped' } else { $ExchangeDetails.'Recoverable Items Used' })</td>
                         <td>$(if ($ExchangeDetails.'Recoverable Items Skipped') { 'Skipped' } else { $ExchangeDetails.'Recoverable Items Count' })</td>
-                        <td>$(if ($ExchangeDetails.'Recoverable Items Skipped') { 'Skipped' } elseif ([int]$ExchangeDetails.'Recoverable Items' -le 0) { 0 } else { [math]::round($ExchangeDetails.'Recoverable Items Used' / $ExchangeDetails.'Recoverable Items', 2) })</td>
+                        <td>$(if ($ExchangeDetails.'Recoverable Items Skipped') { 'Skipped' } else { Format-PerObjectAverage -Total $ExchangeDetails.'Recoverable Items Used' -Count $ExchangeDetails.'Recoverable Items' -ObjectLabel 'mailboxes' })</td>
                     </tr>
                     <tr style="font-weight: bold; background-color: #f2f2f2;">
                         <td>Total</td>
                         <td>$($ExchangeDetails.'Total Mailboxes')</td>
                         <td>$([math]::round($ExchangeDetails.'Total Storage Used' / $capacityMetric, 2))</td>
                         <td>$($ExchangeDetails.'Total Items')</td>
-                        <td>$([math]::round($ExchangeDetails.'Total Storage Used' / $capacityMetric / $ExchangeDetails.'Total Mailboxes', 2))</td>
+                        <td>$(Format-PerObjectAverage -Total $ExchangeDetails.'Total Storage Used' -Count $ExchangeDetails.'Total Mailboxes' -Divisor $capacityMetric -ObjectLabel 'mailboxes')</td>
                     </tr>
                 </tbody>
             </table>
@@ -2458,7 +2614,7 @@ $HTML_CODE = @"
                         <td>$($OneDriveDetails.'Accounts')</td>
                         <td>$([math]::round($OneDriveDetails.'Storage Used' / $capacityMetric, 2))</td>
                         <td>$($OneDriveDetails.'Total Files')</td>
-                        <td>$([math]::round($OneDriveDetails.'Storage Used' / $capacityMetric / $OneDriveDetails.'Accounts', 2) )</td>
+                        <td>$(Format-PerObjectAverage -Total $OneDriveDetails.'Storage Used' -Count $OneDriveDetails.'Accounts' -Divisor $capacityMetric -ObjectLabel 'accounts')</td>
                     </tr>
                 </tbody>
             </table>
@@ -2520,7 +2676,7 @@ $HTML_CODE = @"
                         <td>$($SharePointDetails.'Sites')</td>
                         <td>$([math]::round($SharePointDetails.'Sites Storage Used' / $capacityMetric, 2))</td>
                         <td>$($SharePointDetails.'Account Files')</td>
-                        <td>$([math]::round($SharePointDetails.'Sites Storage Used' / $capacityMetric / $SharePointDetails.'Sites', 2) )</td>
+                        <td>$(Format-PerObjectAverage -Total $SharePointDetails.'Sites Storage Used' -Count $SharePointDetails.'Sites' -Divisor $capacityMetric -ObjectLabel 'sites')</td>
                     </tr>
                 </tbody>
             </table>
@@ -2554,7 +2710,7 @@ $HTML_CODE = @"
                         <td>$UserLicensesRequired</td>
                         <td>$totalStorageGB</td>
                         <td>$totalItems</td>
-                        <td>$([math]::round($totalStorageGB / $UserLicensesRequired, 2))</td>
+                        <td>$(Format-PerObjectAverage -Total $totalStorageGB -Count $UserLicensesRequired -ObjectLabel 'users/accounts')</td>
                     </tr>
                 </tbody>
             </table>
@@ -2575,3 +2731,8 @@ $HTML_CODE | Out-File -FilePath $outFilename
 
 Write-Host "`n`nM365 Sizing information has been written to $((Get-ChildItem $outFilename).FullName)`n`n" -foregroundcolor green
 Write-Host "Thank you for running this script. Please send the .html file to Rubrik." -foregroundcolor green
+
+# Normal-completion cleanup. Disconnect-MgGraph has usually already run once the Graph reports
+# were gathered; Invoke-SizingCleanup tolerates that, and this is the only place the Exchange
+# Online session gets closed on a successful run.
+Invoke-SizingCleanup
