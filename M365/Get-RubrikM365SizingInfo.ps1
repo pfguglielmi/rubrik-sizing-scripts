@@ -106,25 +106,30 @@
     Updated: 26/08/24
     By: Sameer Arora
     Updated: 25/09/26
-    By: In Place Archive gathering made resilient - retry with backoff, failure
+    By: PF Guglielmi (with Claude Code)
+    Changes: In Place Archive gathering made resilient - retry with backoff, failure
         accounting, and checkpoint/resume.
     Updated: 25/09/26
-    By: Recoverable Items gathering made resilient the same way - retry with backoff,
+    By: PF Guglielmi (with Claude Code)
+    Changes: Recoverable Items gathering made resilient the same way - retry with backoff,
         failure accounting, and checkpoint/resume.
     Updated: 25/09/26
-    By: In Place Archive gathering falls back to a per-folder statistics rollup when the
+    By: PF Guglielmi (with Claude Code)
+    Changes: In Place Archive gathering falls back to a per-folder statistics rollup when the
         aggregate archive statistics call still fails after exhausting its retries.
     Updated: 28/09/26
-    By: -ExcludeADGroup is now actually applied (it was accepted but ignored), AD Group
+    By: PF Guglielmi (with Claude Code)
+    Changes: -ExcludeADGroup is now actually applied (it was accepted but ignored), AD Group
         filtering now also scopes the Recoverable Items pass, -UseAppAccess is typed [bool],
         and the unused -AnnualGrowth parameter was removed.
     Updated: 28/09/26
-    By: Hardening for long runs - per-object averages and growth calculations guard against
-        empty populations instead of rendering Infinity/NaN, report CSVs are timestamped so
-        re-runs no longer overwrite them, output paths use Join-Path (a hardcoded backslash
-        was broken on macOS/Linux), -ExportFolder / -ConsecutiveFailureLimit /
-        -ReconnectInterval are now parameters, and Graph and Exchange Online sessions are
-        closed on any exit path.
+    By: PF Guglielmi (with Claude Code)
+    Changes: Hardening for long runs - per-object averages and growth calculations guard
+        against empty populations instead of rendering Infinity/NaN, report CSVs are
+        timestamped so re-runs no longer overwrite them, output paths use Join-Path (a
+        hardcoded backslash was broken on macOS/Linux), -ExportFolder /
+        -ConsecutiveFailureLimit / -ReconnectInterval are now parameters, and Graph and
+        Exchange Online sessions are closed on any exit path.
 #>
 
 [CmdletBinding()]
@@ -936,6 +941,14 @@ if ($SkipSharedMailbox -eq $false) {
   $ExchangeActiveUsers = $ExchangeUsageReportUsers
 }
 
+# $ExchangeUsageReport (every mailbox, deleted or not) is not read again below - everything
+# still needed lives in $ExchangeUsageReportUsers/$ExchangeUsageReportShared/$ExchangeActiveUsers.
+# Releasing it here drops the reference to every DELETED mailbox's row data specifically, since
+# those rows aren't included in any of the filtered arrays that survive it - a real memory win on
+# a tenant with a large deleted-mailbox backlog, not just an array-of-references saving, well
+# before the multi-hour per-mailbox Archive/Recoverable-Items loops later in this script.
+$ExchangeUsageReport = $null
+
 if ($AzureAdRequired) {
   $FilterByField = "User Principal Name"
   if ($IncludeADGroupRequired) {
@@ -1018,6 +1031,12 @@ $ExchangeDetails = [PSCustomObject] @{
   "Calculated Growth %" = $CalculatedGrowth
 }
 
+# $ExchangeUsageReportShared is fully rolled up into $ExchangeDetails above and is not read
+# again. Its elements are still reachable via $ExchangeActiveUsers (built from it a few lines up),
+# so this mainly reclaims the array-of-references structure itself, not the row objects - see the
+# note on $ExchangeUsageReport above for why that distinction matters here.
+$ExchangeUsageReportShared = $null
+
 ### OneDrive - Get reports for OneDrive and process them
 Write-Host "*** Retrieving usage info for: OneDrive ***" -foregroundcolor green
 Write-Host "Data will be gathered from the chart data and per-account usage report" -foregroundcolor green
@@ -1062,6 +1081,11 @@ Write-Host "Now performing additional filtering..."
 Write-Host ""
 
 $OneDriveUsageReportAccounts = $OneDriveUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' }
+
+# $OneDriveUsageReport (every account, deleted or not) is not read again below - see the note on
+# $ExchangeUsageReport above. Releasing it drops the row data for deleted OneDrive accounts
+# specifically, since those aren't included in $OneDriveUsageReportAccounts.
+$OneDriveUsageReport = $null
 
 if ($AzureAdRequired) {
   $FilterByField = "Owner Principal Name"
@@ -1115,6 +1139,10 @@ $OneDriveDetails = [PSCustomObject] @{
   "Calculated Growth %" = $CalculatedGrowth
 }
 
+# $OneDriveUsageReportAccounts is fully rolled up into $OneDriveDetails above and is not read
+# again.
+$OneDriveUsageReportAccounts = $null
+
 # If AD Group is specified, assume each user is licensed so use that count
 if ($AzureAdRequired) {
   $OneDriveDetails | Add-Member -MemberType NoteProperty -Name 'Accounts' -Value $OneDriveDetails.'Usage Accounts'
@@ -1149,6 +1177,11 @@ Write-Host ""
 
 $SharePointUsageReportSites = $SharePointUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' }
 
+# $SharePointUsageReport (every site, deleted or not) is not read again below - see the note on
+# $ExchangeUsageReport above. Releasing it drops the row data for deleted SharePoint sites
+# specifically, since those aren't included in $SharePointUsageReportSites.
+$SharePointUsageReport = $null
+
 # Calculate metrics for SharePoint sites
 $sharePointStorageSum = $SharePointUsageReportSites | Measure-Object -Property 'Storage Used (Byte)' -Sum
 $sharePointStorageSumDisplay = [math]::Round($sharePointStorageSum.Sum / $capacityMetric, 2)
@@ -1170,6 +1203,10 @@ $SharePointDetails = [PSCustomObject] @{
   "Calculated Growth %" = $CalculatedGrowth
 }
 
+# $SharePointUsageReportSites is fully rolled up into $SharePointDetails above and is not read
+# again.
+$SharePointUsageReportSites = $null
+
 Write-Host "[INFO] Disconnecting from the Microsoft Graph API."
 Disconnect-MgGraph
 
@@ -1182,6 +1219,12 @@ Disconnect-MgGraph
 # Invoke-MailboxKindGathering's -Population parameter downstream regardless of population size.
 $ArchiveMailboxes = @($ExchangeUsageReportUsers | Where-Object { $_.'Has Archive' -eq 'TRUE' })
 $ArchiveMailboxesCount = $ArchiveMailboxes.Count
+
+# $ExchangeUsageReportUsers is not read again below. Its elements remain reachable via
+# $ExchangeActiveUsers (built from it earlier) until that, too, is released further down, so this
+# mainly reclaims $ExchangeUsageReportUsers's own array-of-references structure rather than row
+# data - see the note on $ExchangeUsageReport above.
+$ExchangeUsageReportUsers = $null
 
 # Parse an EXO "size" string of the form "... (N bytes)" - used by both
 # Get-MailboxFolderStatistics's FolderSize and Get-EXOMailboxStatistics's TotalItemSize - into a
@@ -2074,6 +2117,12 @@ if ($null -ne $ArchiveGathering) {
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Archive Items' -Value '-'
 }
 
+# $ArchiveMailboxes is not read again once the Archive gathering pass above has completed.
+# Releasing it here reclaims its array-of-references structure before the Recoverable Items pass
+# below starts (its own -Population, $RIFMailboxes, is a separate array built from
+# $ExchangeActiveUsers, not from $ArchiveMailboxes).
+$ArchiveMailboxes = $null
+
 # The Microsoft Exchange Reports do not contain Recoverable Items sizing information.
 # We need to connect to the Exchange Online module to get this information
 
@@ -2084,6 +2133,11 @@ if ($null -ne $ArchiveGathering) {
 # @(...) guarantees a real, possibly-empty array reaches Invoke-MailboxKindGathering's
 # -Population parameter even if $ExchangeActiveUsers ever collapsed to $null (e.g. an empty tenant).
 $RIFMailboxes = @($ExchangeActiveUsers)
+
+# $ExchangeActiveUsers is not read again - $RIFMailboxes above is its replacement for the rest of
+# the run. This reclaims $ExchangeActiveUsers's own array-of-references structure; the underlying
+# mailbox objects remain reachable via $RIFMailboxes.
+$ExchangeActiveUsers = $null
 
 # No .GetNewClosure() needed: this scriptblock is created fresh right here (not reused across
 # loop iterations), so it resolves $RIFRetryDelaySeconds/$EnableDebug via normal lexical scoping
