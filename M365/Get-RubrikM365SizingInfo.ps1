@@ -43,6 +43,17 @@
     is written to a checkpoint file as it is gathered so an interrupted run can be resumed
     with -ResumeRIF instead of starting over.
 
+    Both of those per-mailbox passes are single-threaded by default. On a very large tenant
+    they dominate the run time, so -MaxParallelWorkers can gather several mailboxes at once.
+    It requires PowerShell 7 and -UseAppAccess $true, because each worker opens its own
+    Exchange Online connection and only app authentication can do that without prompting; the
+    run warns and continues sequentially when either is missing. The main thread still writes
+    the checkpoint, so the file format and -ResumeArchive/-ResumeRIF are unchanged, and an
+    interrupted parallel run loses at most one in-flight batch. Exchange Online throttles on
+    request budget rather than connection count, so expect roughly 4-8x rather than a speedup
+    proportional to the worker count; the run reduces its own worker count when it sees
+    throttling.
+
 .EXAMPLE
     PS C:\> .\Get-RubrikM365SizingInfo.ps1
     Opens a browser window to authenticate to M365 Graph APIs and Microsoft Exchange
@@ -89,6 +100,16 @@
     allow 50 consecutive mailbox failures before the circuit breaker stops retrying. Useful
     on very large or historically noisy tenants.
 
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -UseAppAccess $true -MaxParallelWorkers 4
+    Gather per-mailbox In Place Archive and Recoverable Items stats four mailboxes at a time
+    instead of one. Requires PowerShell 7 and app authentication; falls back to sequential
+    with a warning otherwise.
+
+    PS C:\> .\Get-RubrikM365SizingInfo.ps1 -UseAppAccess $true -MaxParallelWorkers 4 -ParallelBatchSize 400
+    As above, but checkpoint and re-evaluate throttling every 400 mailboxes rather than the
+    derived default of MaxParallelWorkers * 250. Smaller batches lose less work to an
+    interruption; larger ones spend less time reconnecting.
+
     PS C:\> .\Get-RubrikM365SizingInfo.ps1 -ADGroup <ad_group_name>
     Gather user info for only the AD Group specified.
 
@@ -130,6 +151,13 @@
         hardcoded backslash was broken on macOS/Linux), -ExportFolder /
         -ConsecutiveFailureLimit / -ReconnectInterval are now parameters, and Graph and
         Exchange Online sessions are closed on any exit path.
+    Updated: 28/09/26
+    By: PF Guglielmi (with Claude Code)
+    Changes: Optional parallelism for the two per-mailbox passes via -MaxParallelWorkers /
+        -ParallelBatchSize. The main thread still owns the checkpoint, the circuit breaker and
+        all progress output, so the checkpoint format and resume behaviour are unchanged and
+        the default of 1 worker takes the original single-threaded path. Requires PowerShell 7
+        and -UseAppAccess $true, since each worker opens its own Exchange Online connection.
 #>
 
 [CmdletBinding()]
@@ -212,6 +240,24 @@ param (
     [Parameter()]
     [ValidateRange(1, 100000)]
     [int]$ReconnectInterval = 500,
+    # Number of mailboxes to gather concurrently. 1 (the default) takes the original
+    # single-threaded path unchanged. Above 1 requires PowerShell 7 and -UseAppAccess $true,
+    # because every worker has to open its own Exchange Online connection and only app
+    # authentication can do that without prompting; the run warns and falls back to sequential
+    # otherwise. Exchange Online throttles on request budget rather than connection count, so
+    # the realistic gain is roughly 4-8x - beyond about 8 workers this usually buys throttling
+    # rather than throughput.
+    [Parameter()]
+    [ValidateRange(1, 16)]
+    [int]$MaxParallelWorkers = 1,
+    # Mailboxes dispatched per parallel batch. 0 (the default) derives it as
+    # MaxParallelWorkers * 250. This is both the checkpoint durability window - an interrupted
+    # parallel run loses at most one in-flight batch - and how often the run can react to
+    # throttling, so smaller is safer while larger amortises the per-batch reconnect over more
+    # mailboxes. Ignored when -MaxParallelWorkers is 1.
+    [Parameter()]
+    [ValidateRange(0, 100000)]
+    [int]$ParallelBatchSize = 0,
     # UseAppAccess indicates that the user wants to access Exchange through App access
     # instead of delegated user access.
     [Parameter(HelpMessage="Set this to true when you want to access Exchange through
@@ -611,7 +657,26 @@ function Get-AccessToken {
 # Refresh the EXO connection so the access token does not age out during the
 # multi-day archive enumeration on very large tenants (SPARK-887257).
 function Reset-ExoConnection {
-  try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+  param (
+    # Disconnect only this connection instead of every connection the module knows about.
+    # Load-bearing inside a parallel worker: all the worker runspaces live in one process, so
+    # an unqualified Disconnect-ExchangeOnline would tear down the sibling workers' sessions
+    # as well as this one's. A worker sets $script:ExoConnectionId in its own runspace rather
+    # than passing this, because the reconnect is reached from deep inside the retry driver.
+    # The sequential path sets neither and keeps the original disconnect-everything behaviour.
+    [Parameter()]
+    [string]$ConnectionId
+  )
+
+  $TargetConnectionId = if ($ConnectionId) { $ConnectionId } else { $script:ExoConnectionId }
+
+  try {
+    if ($TargetConnectionId) {
+      Disconnect-ExchangeOnline -ConnectionId $TargetConnectionId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    } else {
+      Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    }
+  } catch { }
   if ($script:ExoAuthMode -eq 'App') {
     $token = Get-AccessToken -clientId $script:ExoClientId -clientSecret $script:ExoClientSecret -tenantId $script:ExoTenantId
     Connect-ExchangeOnlineForSizing -AccessToken $token -Organization $script:ExoTenantId
@@ -619,6 +684,13 @@ function Reset-ExoConnection {
     Connect-ExchangeOnlineForSizing -UserPrincipalName $script:ExoUserPrincipalName
   } else {
     Connect-ExchangeOnlineForSizing
+  }
+
+  # Re-point this runspace at the connection just opened. Without it the next reset here would
+  # target the now-dead ConnectionId and disconnect nothing, leaking a session per reset. Only
+  # runs when a ConnectionId was in play to begin with, so the sequential path is untouched.
+  if ($TargetConnectionId) {
+    $script:ExoConnectionId = [string](@(Get-ConnectionInformation)[0].ConnectionId)
   }
 }
 
@@ -805,6 +877,27 @@ if ($UseAppAccess -eq $true) {
             return
         }
     }
+}
+
+# Parallel gathering needs every worker runspace to open its own Exchange Online connection,
+# because EXO connection state does not cross a runspace boundary. Only app authentication can
+# do that without an interactive prompt per worker, and ForEach-Object -Parallel is PowerShell 7
+# only. Both are checked here, once, rather than discovered hours into a run - and the fallback
+# is the sequential path, which is always correct, just slower.
+if ($MaxParallelWorkers -gt 1) {
+  if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host "[WARN] -MaxParallelWorkers $MaxParallelWorkers requires PowerShell 7 (this is $($PSVersionTable.PSVersion)). Falling back to sequential gathering." -foregroundcolor yellow
+    $MaxParallelWorkers = 1
+  } elseif ($script:ExoAuthMode -ne 'App') {
+    Write-Host "[WARN] -MaxParallelWorkers $MaxParallelWorkers requires -UseAppAccess `$true: each worker connects to Exchange Online itself, which delegated authentication cannot do without prompting. Falling back to sequential gathering." -foregroundcolor yellow
+    $MaxParallelWorkers = 1
+  } else {
+    if ($ParallelBatchSize -le 0) { $ParallelBatchSize = $MaxParallelWorkers * 250 }
+    if ($MaxParallelWorkers -gt 8) {
+      Write-Host "[WARN] -MaxParallelWorkers is $MaxParallelWorkers. Exchange Online throttles on request budget, so beyond about 8 workers this usually buys throttling rather than throughput." -foregroundcolor yellow
+    }
+    Write-Host "[INFO] Mailbox stats will be gathered with up to $MaxParallelWorkers parallel workers, $ParallelBatchSize mailboxes per batch." -foregroundcolor green
+  }
 }
 
 # Resolve one Azure AD group by display name to the list of User Principal Names it contains
@@ -1717,6 +1810,50 @@ function Compact-Checkpoint {
   }
 }
 
+# Function definitions do not cross a runspace boundary: a ForEach-Object -Parallel body sees
+# none of this script's functions. Rather than pasting them into the worker as literal text
+# (which would rot the moment one of them is edited), rebuild the definitions from the live
+# functions at call time and hand the resulting string to each worker to evaluate once.
+#
+# Each is emitted as 'function global:Name' deliberately. Invoke-Expression defines into the
+# CURRENT scope, and a ForEach-Object -Parallel body gets a fresh scope per item - so without
+# the global: prefix the functions would vanish between mailboxes even though the runspace
+# itself is reused. The global scope is per-runspace, so this does not leak across workers.
+#
+# The default list is the transitive closure of what one per-mailbox fetch actually touches:
+# the two stats entry points, the shared retry driver, the two error classifiers, the byte-size
+# parser, and the reconnect path (Reset-ExoConnection reaches Get-AccessToken and
+# Connect-ExchangeOnlineForSizing, and through the latter the broker-conflict helpers).
+function Get-ParallelWorkerPreamble {
+  param (
+    [Parameter()]
+    [string[]]$FunctionNames = @(
+      'ConvertFrom-ExoByteSizeString'
+      'Test-ExoTransientError'
+      'Test-ExoSessionError'
+      'Invoke-MailboxStatsWithRetry'
+      'Get-ArchiveMailboxStats'
+      'Get-RIFStatsForMailbox'
+      'Get-AccessToken'
+      'Reset-ExoConnection'
+      'Connect-ExchangeOnlineForSizing'
+      'Test-ExoBrokerAssemblyConflict'
+      'Write-ExoBrokerRemediation'
+    )
+  )
+
+  $Builder = [System.Text.StringBuilder]::new()
+  foreach ($Name in $FunctionNames) {
+    # .ScriptBlock is the body alone - param block included, enclosing braces not - so the
+    # 'function X { ... }' wrapper has to be put back around it.
+    $Definition = (Get-Command -Name $Name -CommandType Function -ErrorAction Stop).ScriptBlock
+    [void]$Builder.AppendLine("function global:$Name {")
+    [void]$Builder.AppendLine([string]$Definition)
+    [void]$Builder.AppendLine('}')
+  }
+  return $Builder.ToString()
+}
+
 # Drives per-mailbox stats gathering over a population: checkpoint read/resume/compact, a
 # do/while loop with periodic EXO reconnect, per-mailbox retry via $GetStatsForMailbox, a
 # consecutive-failure circuit breaker, a failures CSV, and the summary Write-Host block. Shared
@@ -1788,16 +1925,37 @@ function Invoke-MailboxStatsGathering {
     [int]$ConsecutiveFailureLimit = 25,
 
     [Parameter()]
-    [int]$ReconnectInterval = 500
+    [int]$ReconnectInterval = 500,
+
+    # Values $GetStatsForMailbox needs but must not capture from script scope: a captured
+    # variable resolves to $null inside a parallel worker runspace, silently, which would
+    # quietly change retry counts rather than fail. Passed as the scriptblock's third argument
+    # on both paths so there is one calling convention, not two.
+    [Parameter()]
+    [hashtable]$WorkerConfig = @{},
+
+    # See the top-level -MaxParallelWorkers / -ParallelBatchSize parameters. 1 takes the
+    # original single-threaded do/while below, unchanged.
+    [Parameter()]
+    [int]$MaxParallelWorkers = 1,
+
+    [Parameter()]
+    [int]$ParallelBatchSize = 0
   )
 
   $MailboxList = [System.Collections.Generic.List[object]]::new()
   $FailedList = [System.Collections.Generic.List[object]]::new()
   $PopulationCount = $Population.Count
   $CurrentMailboxNum = 0
-  $ProcessedCount = 0
-  $ConsecutiveFailures = 0
-  $RetryEnabled = $true
+  # These three live in a hashtable rather than as plain variables because $HandleResult below
+  # is a scriptblock: assigning to a parent-scope variable from inside a scriptblock creates a
+  # local copy instead, so the counters would silently never advance. Mutating members of a
+  # shared hashtable does propagate.
+  $LoopState = @{
+    ProcessedCount      = 0
+    ConsecutiveFailures = 0
+    RetryEnabled        = $true
+  }
   $CompletedMap = @{}
   $CheckpointWriter = $null
 
@@ -1846,67 +2004,238 @@ function Invoke-MailboxStatsGathering {
   }
   Write-Host "Checkpoint file for this run: $CheckpointFullPath" -foregroundcolor green
 
+  # Per-result bookkeeping, shared verbatim by the sequential and parallel paths: success and
+  # failure accounting, the consecutive-failure circuit breaker, and the checkpoint line. In one
+  # scriptblock rather than written out twice so the two paths cannot drift in what they record -
+  # the totals, the failure CSV and the checkpoint all come from here.
+  $HandleResult = {
+    param($Stats)
+
+    if ($Stats.Status -eq 'OK') {
+      [void]$MailboxList.Add($Stats)
+      $LoopState.ConsecutiveFailures = 0
+      if (-not $LoopState.RetryEnabled) {
+        Write-Host "[INFO] Mailbox stats are succeeding again; re-enabling retries."
+        $LoopState.RetryEnabled = $true
+      }
+    } else {
+      [void]$FailedList.Add($Stats)
+      Write-Host "[WARN] Could not get $Kind stats for $($Stats.UserPrincipalName) after $($Stats.Attempts) attempt(s): $($Stats.ErrorType)"
+      $LoopState.ConsecutiveFailures += 1
+      # Bound the damage when something systemic is being misread as transient: without this,
+      # a tenant-wide outage would spend 15s of backoff on every one of tens of thousands of
+      # mailboxes before finishing.
+      if ($LoopState.RetryEnabled -and $LoopState.ConsecutiveFailures -ge $ConsecutiveFailureLimit) {
+        Write-Host "[WARN] $($LoopState.ConsecutiveFailures) mailboxes failed in a row. Disabling retries to avoid stalling the run; failures are still counted." -foregroundcolor yellow
+        $LoopState.RetryEnabled = $false
+        # With retries off, each mailbox gets a single attempt and so never reaches the
+        # session-recovery reconnect inside $GetStatsForMailbox. A run of failures this long
+        # is most often a dead session, so reconnect once here.
+        Write-Host "[INFO] Refreshing the Exchange Online connection before continuing."
+        try { Reset-ExoConnection } catch {
+          Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
+        }
+      }
+    }
+
+    $CheckpointWriter.WriteLine("`"$($Stats.UserPrincipalName)`",$($Stats.($SizeField)),$($Stats.($ItemsField)),$($Stats.Status),$($Stats.ErrorType)")
+    $LoopState.ProcessedCount += 1
+  }
+
   # The do/while below runs once even on an empty collection, indexing [0] and querying a null
   # identity. That is reachable whenever a tenant has no mailboxes in this population at all.
   if ($PopulationCount -gt 0) {
   try {
-    do {
-      if ( ($CurrentMailboxNum % 10) -eq 0 ) {
-        Write-Host "[$CurrentMailboxNum / $PopulationCount] Processing mailboxes ..."
-      }
-      $CurrentMailbox = $Population[$CurrentMailboxNum]
-      $CurrentUser = $CurrentMailbox.'User Principal Name'
-      # An if-block rather than 'continue': inside do/while, continue re-tests the loop
-      # condition and is an easy thing to misread in review.
-      if (-not $CompletedMap.ContainsKey($CurrentUser)) {
-        $AttemptsForThisMailbox = if ($RetryEnabled) { $MaxAttempts } else { 1 }
-        $Stats = & $GetStatsForMailbox $CurrentMailbox $AttemptsForThisMailbox
+    if ($MaxParallelWorkers -gt 1) {
+      # Batched parallel. The main thread owns everything shared: it slices the work, writes the
+      # checkpoint, runs the circuit breaker and prints progress. Workers only compute, and
+      # nothing mutable crosses a thread boundary in either direction - which is why the
+      # checkpoint format, Read-Checkpoint, Compact-Checkpoint and -Resume all stay untouched.
 
-        if ($Stats.Status -eq 'OK') {
-          [void]$MailboxList.Add($Stats)
-          $ConsecutiveFailures = 0
-          if (-not $RetryEnabled) {
-            Write-Host "[INFO] Mailbox stats are succeeding again; re-enabling retries."
-            $RetryEnabled = $true
+      # Filtering here, on the main thread, is what keeps -Resume correct in parallel mode: a
+      # worker never sees a mailbox the checkpoint already has.
+      $Pending = @($Population | Where-Object { -not $CompletedMap.ContainsKey($_.'User Principal Name') })
+      $BatchSize = if ($ParallelBatchSize -gt 0) { $ParallelBatchSize } else { $MaxParallelWorkers * 250 }
+      $EffectiveWorkers = $MaxParallelWorkers
+
+      # Everything a worker needs, captured once out here: neither $script: variables nor
+      # function definitions cross a runspace boundary, so they have to travel by value.
+      $Preamble = Get-ParallelWorkerPreamble
+      $StatsBlockText = [string]$GetStatsForMailbox
+      $AppTenantId = [string]$script:ExoTenantId
+      $AppClientId = [string]$script:ExoClientId
+      $AppClientSecret = [string]$script:ExoClientSecret
+
+      Write-Host "[INFO] $($Pending.Count) of $PopulationCount $Kind mailboxes still to gather; batch size $BatchSize."
+
+      for ($BatchStart = 0; $BatchStart -lt $Pending.Count; $BatchStart += $BatchSize) {
+        $BatchEnd = [math]::Min($BatchStart + $BatchSize, $Pending.Count) - 1
+        $Batch = @($Pending[$BatchStart..$BatchEnd])
+        # Read once per batch rather than per mailbox: the whole batch is dispatched at once, so
+        # the breaker cannot change its mind partway through one anyway.
+        $AttemptsForThisBatch = if ($LoopState.RetryEnabled) { $MaxAttempts } else { 1 }
+
+        Write-Host "[$BatchStart / $($Pending.Count)] Processing mailboxes ($($Batch.Count) in this batch, $EffectiveWorkers worker(s)) ..."
+
+        # One shard per worker rather than one mailbox per parallel item. ForEach-Object
+        # -Parallel was measured NOT to reuse its pool runspaces across items here, so a
+        # per-mailbox item would re-import the module, rebuild the worker functions and open a
+        # fresh Exchange Online connection for every single mailbox - slower than running
+        # sequentially. A shard is one parallel item, so that setup happens once per worker per
+        # batch by construction rather than by relying on runspace reuse.
+        #
+        # Dealt round-robin, not as contiguous slices: mailbox cost varies enormously, and a
+        # cluster of expensive mailboxes sitting next to each other in the population would
+        # otherwise land entirely in one shard and hold up the whole batch.
+        $ShardCount = [math]::Min($EffectiveWorkers, $Batch.Count)
+        $Shards = @(for ($ShardIndex = 0; $ShardIndex -lt $ShardCount; $ShardIndex++) {
+          , @(for ($i = $ShardIndex; $i -lt $Batch.Count; $i += $ShardCount) { $Batch[$i] })
+        })
+
+        $BatchResults = @($Shards | ForEach-Object -ThrottleLimit $ShardCount -Parallel {
+          $Shard = $_
+          $WorkerAttempts = $using:AttemptsForThisBatch
+          $WorkerConfigLocal = $using:WorkerConfig
+
+          try {
+            # A runspace inherits nothing: no module, no functions from this script, no
+            # connection. All of it once per shard - the entire reason a shard, not a mailbox,
+            # is the unit of parallelism here.
+            #
+            # Import-Module is explicit rather than left to auto-loading so a runspace that
+            # cannot find the module fails here, with a clear message, instead of at the first
+            # cmdlet call.
+            Import-Module ExchangeOnlineManagement -ErrorAction Stop
+            Invoke-Expression $using:Preamble
+            # Reset-ExoConnection and its callees read these through $script:, which resolves
+            # to the global scope for a function not defined in a script file - which is
+            # exactly what the Invoke-Expression above produces.
+            $global:ExoAuthMode = 'App'
+            $global:ExoTenantId = $using:AppTenantId
+            $global:ExoClientId = $using:AppClientId
+            $global:ExoClientSecret = $using:AppClientSecret
+
+            $WorkerToken = Get-AccessToken -clientId $global:ExoClientId -clientSecret $global:ExoClientSecret -tenantId $global:ExoTenantId
+            Connect-ExchangeOnline -AccessToken $WorkerToken -Organization $global:ExoTenantId -ShowBanner:$false -SkipLoadingFormatData
+            # Recording the id scopes every later disconnect in this runspace to the connection
+            # it just opened. An unqualified Disconnect-ExchangeOnline would drop the sibling
+            # workers' sessions too, since all the runspaces share one process.
+            $global:ExoConnectionId = [string](@(Get-ConnectionInformation)[0].ConnectionId)
+          } catch {
+            # Setup failed, so nothing in this shard can be gathered. Emit a marker per mailbox
+            # so they are all counted as failures and retried on the next -Resume, instead of
+            # disappearing from both the totals and the failure count.
+            $SetupError = [string]$_.Exception.Message
+            foreach ($ShardMailbox in $Shard) {
+              [PSCustomObject]@{
+                UserPrincipalName = [string]$ShardMailbox.'User Principal Name'
+                WorkerError = "Worker setup failed: $SetupError"
+              }
+            }
+            return
           }
-        } else {
-          [void]$FailedList.Add($Stats)
-          Write-Host "[WARN] Could not get $Kind stats for $CurrentUser after $($Stats.Attempts) attempt(s): $($Stats.ErrorType)"
-          $ConsecutiveFailures += 1
-          # Bound the damage when something systemic is being misread as transient: without this,
-          # a tenant-wide outage would spend 15s of backoff on every one of tens of thousands of
-          # mailboxes before finishing.
-          if ($RetryEnabled -and $ConsecutiveFailures -ge $ConsecutiveFailureLimit) {
-            Write-Host "[WARN] $ConsecutiveFailures mailboxes failed in a row. Disabling retries to avoid stalling the run; failures are still counted." -foregroundcolor yellow
-            $RetryEnabled = $false
-            # With retries off, each mailbox gets a single attempt and so never reaches the
-            # session-recovery reconnect inside $GetStatsForMailbox. A run of failures this long
-            # is most often a dead session, so reconnect once here.
-            Write-Host "[INFO] Refreshing the Exchange Online connection before continuing."
+
+          $WorkerStats = [scriptblock]::Create($using:StatsBlockText)
+          foreach ($ShardMailbox in $Shard) {
+            try {
+              & $WorkerStats $ShardMailbox $WorkerAttempts $WorkerConfigLocal
+            } catch {
+              # The per-mailbox retry driver does not throw, so anything here is outside it.
+              # Caught per mailbox so one bad mailbox cannot cost the rest of the shard.
+              [PSCustomObject]@{
+                UserPrincipalName = [string]$ShardMailbox.'User Principal Name'
+                WorkerError = [string]$_.Exception.Message
+              }
+            }
+          }
+
+          # Close this worker's own session rather than leaving it to idle out. Possible only
+          # because the shard owns its connection for a known span; scoped by ConnectionId so
+          # it cannot touch a sibling worker's session.
+          try { Disconnect-ExchangeOnline -ConnectionId $global:ExoConnectionId -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+        })
+
+        $ResultsByUser = @{}
+        foreach ($Result in $BatchResults) {
+          if ($null -ne $Result -and $Result.UserPrincipalName) { $ResultsByUser[[string]$Result.UserPrincipalName] = $Result }
+        }
+
+        # Replay in submission order. Results arrive in completion order, and the breaker counts
+        # consecutive failures, so without this the count would depend on which worker happened
+        # to finish first. It is still only an approximation of population order in parallel
+        # mode - workers interleave - which is fine for what the breaker is for: spotting
+        # something systemic, not any exact position in the population.
+        foreach ($Mailbox in $Batch) {
+          $User = [string]$Mailbox.'User Principal Name'
+          $Stats = $null
+          if ($ResultsByUser.ContainsKey($User)) { $Stats = $ResultsByUser[$User] }
+
+          if ($null -eq $Stats -or ($Stats.PSObject.Properties.Name -contains 'WorkerError')) {
+            $FailureMessage = if ($null -eq $Stats) { 'Parallel worker returned no result for this mailbox.' } else { [string]$Stats.WorkerError }
+            $MissingProps = [ordered]@{ "UserPrincipalName" = $User }
+            $MissingProps[$SizeField] = [long]0
+            $MissingProps[$ItemsField] = [long]0
+            $MissingProps["Status"] = 'Failed'
+            $MissingProps["Attempts"] = 0
+            $MissingProps["ErrorType"] = 'WorkerFailure'
+            $MissingProps["ErrorMessage"] = ($FailureMessage -replace '[,"\r\n]', ' ')
+            $Stats = [PSCustomObject]$MissingProps
+          }
+
+          & $HandleResult $Stats
+        }
+
+        # One flush per batch. The durability window in parallel mode is the batch, which is
+        # exactly what -ParallelBatchSize sizes.
+        $CheckpointWriter.Flush()
+
+        # Back off the worker count when Exchange Online is pushing back. Deliberately one-way:
+        # a run that has been throttled once is very likely to be throttled again, and
+        # oscillating the worker count would just spend the request budget rediscovering the
+        # limit over and over.
+        $ThrottledCount = @($Batch | Where-Object {
+          $ThrottleUser = [string]$_.'User Principal Name'
+          $ResultsByUser.ContainsKey($ThrottleUser) -and
+          $ResultsByUser[$ThrottleUser].Status -ne 'OK' -and
+          ([string]$ResultsByUser[$ThrottleUser].ErrorMessage) -match '(?i)(throttl|429|too many requests|micro delay|budget)'
+        }).Count
+        if ($EffectiveWorkers -gt 1 -and $Batch.Count -gt 0 -and (($ThrottledCount / $Batch.Count) -ge 0.1)) {
+          $EffectiveWorkers = [int][math]::Max(1, [math]::Floor($EffectiveWorkers / 2))
+          Write-Host "[WARN] $ThrottledCount of $($Batch.Count) mailboxes in this batch hit Exchange Online throttling. Dropping to $EffectiveWorkers worker(s) for the remaining batches." -foregroundcolor yellow
+        }
+      }
+    } else {
+      do {
+        if ( ($CurrentMailboxNum % 10) -eq 0 ) {
+          Write-Host "[$CurrentMailboxNum / $PopulationCount] Processing mailboxes ..."
+        }
+        $CurrentMailbox = $Population[$CurrentMailboxNum]
+        $CurrentUser = $CurrentMailbox.'User Principal Name'
+        # An if-block rather than 'continue': inside do/while, continue re-tests the loop
+        # condition and is an easy thing to misread in review.
+        if (-not $CompletedMap.ContainsKey($CurrentUser)) {
+          $AttemptsForThisMailbox = if ($LoopState.RetryEnabled) { $MaxAttempts } else { 1 }
+          $Stats = & $GetStatsForMailbox $CurrentMailbox $AttemptsForThisMailbox $WorkerConfig
+
+          & $HandleResult $Stats
+
+          # Flush periodically rather than per mailbox: the durability window is 25 mailboxes,
+          # against tens of thousands of fewer disk flushes on a large tenant.
+          if ( ($LoopState.ProcessedCount % 25) -eq 0 ) { $CheckpointWriter.Flush() }
+
+          # Refresh the EXO connection periodically so the access token doesn't age out mid-run on
+          # very large tenants. Counting processed mailboxes rather than the loop index means a
+          # resume that skips thousands of completed users does not fire pointless reconnects.
+          if ( ($LoopState.ProcessedCount % $ReconnectInterval) -eq 0 ) {
+            Write-Host "[INFO] Refreshing Exchange Online connection at $CurrentMailboxNum / $PopulationCount to avoid token timeout."
             try { Reset-ExoConnection } catch {
               Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
             }
           }
         }
-
-        $CheckpointWriter.WriteLine("`"$($Stats.UserPrincipalName)`",$($Stats.($SizeField)),$($Stats.($ItemsField)),$($Stats.Status),$($Stats.ErrorType)")
-        $ProcessedCount += 1
-        # Flush periodically rather than per mailbox: the durability window is 25 mailboxes,
-        # against tens of thousands of fewer disk flushes on a large tenant.
-        if ( ($ProcessedCount % 25) -eq 0 ) { $CheckpointWriter.Flush() }
-
-        # Refresh the EXO connection periodically so the access token doesn't age out mid-run on
-        # very large tenants. Counting processed mailboxes rather than the loop index means a
-        # resume that skips thousands of completed users does not fire pointless reconnects.
-        if ( ($ProcessedCount % $ReconnectInterval) -eq 0 ) {
-          Write-Host "[INFO] Refreshing Exchange Online connection at $CurrentMailboxNum / $PopulationCount to avoid token timeout."
-          try { Reset-ExoConnection } catch {
-            Write-Host "[WARN] EXO reconnect failed: $($_.Exception.Message). Will retry on next interval."
-          }
-        }
-      }
-      $CurrentMailboxNum += 1
-    } while ($CurrentMailboxNum -lt $PopulationCount)
+        $CurrentMailboxNum += 1
+      } while ($CurrentMailboxNum -lt $PopulationCount)
+    }
   } finally {
     if ($null -ne $CheckpointWriter) {
       $CheckpointWriter.Flush()
@@ -2022,7 +2351,16 @@ function Invoke-MailboxKindGathering {
     [int]$ConsecutiveFailureLimit = 25,
 
     [Parameter()]
-    [int]$ReconnectInterval = 500
+    [int]$ReconnectInterval = 500,
+
+    [Parameter()]
+    [hashtable]$WorkerConfig = @{},
+
+    [Parameter()]
+    [int]$MaxParallelWorkers = 1,
+
+    [Parameter()]
+    [int]$ParallelBatchSize = 0
   )
 
   $Kind = $KindConfig.Kind
@@ -2055,7 +2393,8 @@ function Invoke-MailboxKindGathering {
     -MaxAttempts $MaxAttempts -FailureCsvPrefix $KindConfig.FailureCsvPrefix `
     -ExportFolder $ExportFolder -DateStamp $DateStamp -ScriptVersion $ScriptVersion `
     -CapacityMetric $CapacityMetric -CapacityDisplay $CapacityDisplay `
-    -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
+    -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval `
+    -WorkerConfig $WorkerConfig -MaxParallelWorkers $MaxParallelWorkers -ParallelBatchSize $ParallelBatchSize
 
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name $PropertyPrefix -Value $Gathering.SucceededCount
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name "$PropertyPrefix Found" -Value $Gathering.PopulationCount
@@ -2065,22 +2404,30 @@ function Invoke-MailboxKindGathering {
   return $Gathering
 }
 
-# No .GetNewClosure() needed: this scriptblock is created fresh right here (not reused across
-# loop iterations), so it resolves $ArchiveRetryDelaySeconds/$EnableDebug/$SkipArchiveFallback/
-# $ArchiveFallbackMaxAttempts via normal lexical scoping to this block. GetNewClosure() binds to a
-# new, isolated session state, which can fail to resolve commands that aren't part of that fresh
-# state.
+# This scriptblock captures nothing, deliberately. It used to read $ArchiveRetryDelaySeconds /
+# $EnableDebug / $SkipArchiveFallback / $ArchiveFallbackMaxAttempts by lexical scoping to this
+# file, which is correct when it runs on the main thread and silently wrong when it is
+# reconstructed inside a parallel worker runspace, where those names resolve to $null and the
+# fetch quietly runs with the wrong retry settings instead of failing. Everything it needs now
+# arrives in $WorkerConfig, which travels by value into a worker.
+$ArchiveWorkerConfig = @{
+  RetryDelaySeconds          = $ArchiveRetryDelaySeconds
+  ShowRetryDetail            = $EnableDebug
+  EnableFolderRollupFallback = (-not $SkipArchiveFallback)
+  FallbackMaxAttempts        = $ArchiveFallbackMaxAttempts
+}
+
 $GetArchiveStatsForMailbox = {
-  param($Mailbox, $AttemptsForThisMailbox)
-  # Capped at $AttemptsForThisMailbox, not just $ArchiveFallbackMaxAttempts: when
+  param($Mailbox, $AttemptsForThisMailbox, $WorkerConfig)
+  # Capped at $AttemptsForThisMailbox, not just the configured fallback attempts: when
   # Invoke-MailboxStatsGathering's consecutive-failure breaker has tripped, it collapses
   # $AttemptsForThisMailbox to 1 specifically so a tenant-wide outage gets one fast attempt per
   # mailbox instead of a full backoff sequence. Without this cap the fallback would still run its
   # own multi-attempt retry-with-backoff underneath that single-attempt primary call, reintroducing
   # the exact per-mailbox stall the breaker exists to avoid.
-  $FallbackAttemptsForThisMailbox = [math]::Min($ArchiveFallbackMaxAttempts, $AttemptsForThisMailbox)
-  Get-ArchiveMailboxStats -UserPrincipalName $Mailbox.'User Principal Name' -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $ArchiveRetryDelaySeconds -ShowRetryDetail $EnableDebug `
-    -EnableFolderRollupFallback (-not $SkipArchiveFallback) -FallbackMaxAttempts $FallbackAttemptsForThisMailbox
+  $FallbackAttemptsForThisMailbox = [math]::Min($WorkerConfig.FallbackMaxAttempts, $AttemptsForThisMailbox)
+  Get-ArchiveMailboxStats -UserPrincipalName $Mailbox.'User Principal Name' -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $WorkerConfig.RetryDelaySeconds -ShowRetryDetail $WorkerConfig.ShowRetryDetail `
+    -EnableFolderRollupFallback $WorkerConfig.EnableFolderRollupFallback -FallbackMaxAttempts $FallbackAttemptsForThisMailbox
 }
 
 $ArchiveKindConfig = @{
@@ -2100,7 +2447,8 @@ $ArchiveGathering = Invoke-MailboxKindGathering -KindConfig $ArchiveKindConfig -
   -CheckpointFilename $ArchiveCheckpointFilename -Resume $ResumeArchive -MaxAttempts $ArchiveMaxAttempts `
   -ExportFolder $ExportFolder -DateStamp $dateStringHH -ScriptVersion $Version `
   -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails `
-  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
+  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval `
+  -WorkerConfig $ArchiveWorkerConfig -MaxParallelWorkers $MaxParallelWorkers -ParallelBatchSize $ParallelBatchSize
 
 if ($null -ne $ArchiveGathering) {
   # 'Archive Mailboxes' is the count actually read, not the population: it is the denominator of
@@ -2139,14 +2487,17 @@ $RIFMailboxes = @($ExchangeActiveUsers)
 # mailbox objects remain reachable via $RIFMailboxes.
 $ExchangeActiveUsers = $null
 
-# No .GetNewClosure() needed: this scriptblock is created fresh right here (not reused across
-# loop iterations), so it resolves $RIFRetryDelaySeconds/$EnableDebug via normal lexical scoping
-# to this block. GetNewClosure() binds to a new, isolated session state, which can fail to
-# resolve commands that aren't part of that fresh state.
+# Captures nothing, for the same reason as $GetArchiveStatsForMailbox above: a variable this
+# block closed over would resolve to $null inside a parallel worker runspace rather than raise.
+$RIFWorkerConfig = @{
+  RetryDelaySeconds = $RIFRetryDelaySeconds
+  ShowRetryDetail   = $EnableDebug
+}
+
 $GetRIFStatsForMailbox = {
-  param($Mailbox, $AttemptsForThisMailbox)
+  param($Mailbox, $AttemptsForThisMailbox, $WorkerConfig)
   $IncludeArchiveMailbox = ($Mailbox.'Has Archive' -eq 'TRUE')
-  Get-RIFStatsForMailbox -UserPrincipalName $Mailbox.'User Principal Name' -IncludeArchiveMailbox $IncludeArchiveMailbox -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $RIFRetryDelaySeconds -ShowRetryDetail $EnableDebug
+  Get-RIFStatsForMailbox -UserPrincipalName $Mailbox.'User Principal Name' -IncludeArchiveMailbox $IncludeArchiveMailbox -MaxAttempts $AttemptsForThisMailbox -RetryDelaySeconds $WorkerConfig.RetryDelaySeconds -ShowRetryDetail $WorkerConfig.ShowRetryDetail
 }
 
 $RIFKindConfig = @{
@@ -2166,7 +2517,8 @@ $RIFGathering = Invoke-MailboxKindGathering -KindConfig $RIFKindConfig -SkipFlag
   -CheckpointFilename $RIFCheckpointFilename -Resume $ResumeRIF -MaxAttempts $RIFMaxAttempts `
   -ExportFolder $ExportFolder -DateStamp $dateStringHH -ScriptVersion $Version `
   -CapacityMetric $capacityMetric -CapacityDisplay $capacityDisplay -ExchangeDetails $ExchangeDetails `
-  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval
+  -ConsecutiveFailureLimit $ConsecutiveFailureLimit -ReconnectInterval $ReconnectInterval `
+  -WorkerConfig $RIFWorkerConfig -MaxParallelWorkers $MaxParallelWorkers -ParallelBatchSize $ParallelBatchSize
 
 if ($null -ne $RIFGathering) {
   $ExchangeDetails | Add-Member -MemberType NoteProperty -Name 'Recoverable Items Used' -Value $RIFGathering.ConvertedSize
