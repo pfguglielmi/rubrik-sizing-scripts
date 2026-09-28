@@ -2,7 +2,7 @@
 .SYNOPSIS
     Get-RubrikM365SizingInfo.ps1 returns M365 usage information for a subscription.
 .DESCRIPTION
-    Get-RubrikM365SizingInfo.ps1 returns M365 usage information for a subscprtion.
+    Get-RubrikM365SizingInfo.ps1 returns M365 usage information for a subscription.
     Data is gathered using the Microsoft Graph APIs and Exchange module.
 
     The usage data should be similar to the metrics in the Admin Center under each
@@ -199,8 +199,6 @@ $capacityMetric = $GB
 $capacityDisplay = 'GB'
 
 Write-Host "Starting the Rubrik Microsoft 365 sizing script ($Version)."
-
-$ExchangeHTMLTitle = "User"
 
 if ($AnnualGrowth -eq '') {
   $AnnualGrowth = 30
@@ -817,7 +815,7 @@ $OneDriveTotalUsersCount = $OneDriveUsageReport.count
 $OneDriveNonDeletedUsersCount = $($OneDriveUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' }).count
 $OneDriveDeletedUsersCount = $($OneDriveUsageReport | Where-Object { $_.'Is Deleted' -eq 'TRUE' }).count
 
-Write-Host "Total # of accounts - from usage report: $($OneDriveUsageReportAccounts.count)"
+Write-Host "Total # of accounts - from usage report: $OneDriveTotalUsersCount"
 Write-Host "Total # of deleted accounts - from usage report: $OneDriveDeletedUsersCount"
 Write-Host "Total # of active (non-deleted) accounts - from usage report: $OneDriveNonDeletedUsersCount"
 Write-Host "Now performing additional filtering..."
@@ -854,7 +852,7 @@ Write-Host ""
 
 Write-Host "Getting historical OneDrive storage growth" -foregroundcolor green
 $ReportCSV = Get-MgReport -ReportName 'getOneDriveUsageStorage' -Period $Period
-$CalculatedGrowth = Measure-AverageGrowth -ReportCSV $ReportCSV -ReportName 'Exchange'
+$CalculatedGrowth = Measure-AverageGrowth -ReportCSV $ReportCSV -ReportName 'OneDrive'
 
 $OneDriveDetails = [PSCustomObject] @{
   "Chart Accounts" = $OneDriveChartAccount[0].total
@@ -889,8 +887,8 @@ $SharePointUsageReport = Import-Csv -Path $ReportCSV
 
 # Calculate metrics for SharePoint Sites
 $SharePointSitesCount = $SharePointUsageReport.count
-$SharePointNonDeletedSitesCount = $($SharePointUsageReportSites | Where-Object { $_.'Is Deleted' -eq 'FALSE' }).count
-$SharePointDeletedSitesCount = $($SharePointUsageReportSites | Where-Object { $_.'Is Deleted' -eq 'TRUE' }).count
+$SharePointNonDeletedSitesCount = $($SharePointUsageReport | Where-Object { $_.'Is Deleted' -eq 'FALSE' }).count
+$SharePointDeletedSitesCount = $($SharePointUsageReport | Where-Object { $_.'Is Deleted' -eq 'TRUE' }).count
 
 Write-Host "Total # of sites - from usage report: $SharePointSitesCount"
 Write-Host "Total # of deleted mailboxes - from usage report: $SharePointDeletedSitesCount"
@@ -910,9 +908,9 @@ Write-Host "SharePoint Sites storage used: $sharePointStorageSumDisplay $capacit
 Write-Host "SharePoint Sites file count: $($sharePointFiles.sum)" -foregroundcolor green
 Write-Host ""
 
-Write-Host "Getting historical OneDrive storage growth" -foregroundcolor green
+Write-Host "Getting historical SharePoint storage growth" -foregroundcolor green
 $ReportCSV = Get-MgReport -ReportName 'getSharePointSiteUsageStorage' -Period $Period
-$CalculatedGrowth = Measure-AverageGrowth -ReportCSV $ReportCSV -ReportName 'Exchange'
+$CalculatedGrowth = Measure-AverageGrowth -ReportCSV $ReportCSV -ReportName 'SharePoint'
 
 $SharePointDetails = [PSCustomObject] @{
   "Sites" = $SharePointUsageReportSites.count
@@ -924,7 +922,7 @@ $SharePointDetails = [PSCustomObject] @{
 Write-Host "[INFO] Disconnecting from the Microsoft Graph API."
 Disconnect-MgGraph
 
-# The Microsoft Exchange Reports do not contain In-Place Archive sizing information.DESCRIPTION
+# The Microsoft Exchange Reports do not contain In-Place Archive sizing information.
 # We need to connect to the Exchange Online module to get this information
 
 # @(...) wraps the PIPELINE, not the resulting variable: a tenant with zero In-Place Archive
@@ -2494,7 +2492,7 @@ $HTML_CODE = @"
     </div>
 
     <footer>
-        <p style="color:#D3D3D3;text-align:right;padding-right: 10px;"<td>$CurrentDate $Version</td>
+        <p style="color:#D3D3D3;text-align:right;padding-right: 10px;">$dateString $Version</p>
     </footer>
 </body>
 </html>
@@ -2503,7 +2501,7 @@ $HTML_CODE = @"
 
 # Remove any previously created files
 Remove-Item -Path $outFilename -ErrorAction SilentlyContinue
-Write-Output $HTML_CODE | Format-Table -AutoSize | Out-File -FilePath $outFilename -Append
+$HTML_CODE | Out-File -FilePath $outFilename
 
 Write-Host "`n`nM365 Sizing information has been written to $((Get-ChildItem $outFilename).FullName)`n`n" -foregroundcolor green
 Write-Host "Thank you for running this script. Please send the .html file to Rubrik." -foregroundcolor green
