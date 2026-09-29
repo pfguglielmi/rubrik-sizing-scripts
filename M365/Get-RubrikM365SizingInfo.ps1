@@ -27,7 +27,9 @@
     If the aggregate archive statistics call still fails after exhausting its retries, the
     script falls back to rolling the mailbox's size up from its per-folder statistics instead -
     a different EXO API path that can succeed when the aggregate call keeps timing out or being
-    throttled. Use -SkipArchiveFallback $true to disable this and only ever use the aggregate call.
+    throttled. The rollup excludes the archive's Recoverable Items folders, which the separate
+    Recoverable Items pass already covers. Use -SkipArchiveFallback $true to disable this and
+    only ever use the aggregate call.
 
     The M365 Usage Reports do not contain information on Exchange Recoverable Items Folder.
     By default, the script will try to gather this information by looping through
@@ -171,6 +173,12 @@
         trip in parallel mode no longer disconnects every worker. Throttling is summarised on
         the console and in the report. Graph report downloads give the Graph SDK more retry
         room and retry the server errors it does not (500/502, retries exhausted).
+    Updated: 29/09/26
+    By: PF Guglielmi (with Claude Code)
+    Changes: The per-folder archive rollup fallback no longer counts the archive's Recoverable
+        Items folders (they are gathered by the separate Recoverable Items pass, so they were
+        double-counted for any mailbox that used the fallback) and requests -ResultSize
+        Unlimited so an archive with more than 1000 folders is not silently under-counted.
 #>
 
 [CmdletBinding()]
@@ -1980,12 +1988,38 @@ function Get-ArchiveMailboxStats {
     # No -FolderScope: unlike Get-RIFStatsForMailbox's Recoverable Items rollup, every folder in
     # the archive mailbox has to be summed to reconstruct the mailbox's total size. Each row's
     # FolderSize is that folder's own content only, not its subfolders', so summing every row
-    # double-counts nothing. There is no Where-Object here, so the Verbose records -Verbose adds
-    # must never reach $FolderStats: Invoke-ExoCallWithSignals drops them, and one that slipped
-    # through would parse as an unparsable size and fail the mailbox permanently.
-    $FolderStats = @(Invoke-ExoCallWithSignals -Signals $Signals -ArgumentList $UserPrincipalName -ScriptBlock {
+    # double-counts no subfolder.
+    #
+    # The Recoverable Items tree is the exception and is dropped here. The unscoped call returns
+    # it, but the primary path's TotalItemSize does not include it, and the separate RIF pass
+    # (Get-RIFStatsForMailbox) is added on top of the archive total - keeping those rows would
+    # count them twice for every mailbox that took this fallback. Observed on a real archive: the
+    # unscoped rows include RecoverableItemsRoot/Deletions/DiscoveryHolds/Purges/SubstrateHolds/
+    # Versions, a CalendarLogging folder that is NOT named RecoverableItems*, and user-created
+    # subfolders such as /DiscoveryHolds/SearchDiscoveryHoldsFolder. So the dumpster is identified
+    # by FolderType first, then by being nested under one of those roots' paths. Matching bare
+    # path names is avoided: a user folder called /Deletions must still be counted.
+    #
+    # -ResultSize Unlimited: the Exchange Online default is 1000 rows, which would silently
+    # under-count an archive with more folders than that.
+    #
+    # Verbose records -Verbose adds must never reach $AllFolders: Invoke-ExoCallWithSignals drops
+    # them, and one that slipped through would parse as an unparsable size and fail the mailbox
+    # permanently.
+    $AllFolders = @(Invoke-ExoCallWithSignals -Signals $Signals -ArgumentList $UserPrincipalName -ScriptBlock {
         param($Identity)
-        Get-MailboxFolderStatistics -Identity $Identity -Archive -Verbose -ErrorAction Stop
+        Get-MailboxFolderStatistics -Identity $Identity -Archive -ResultSize Unlimited -Verbose -ErrorAction Stop
+      })
+
+    $IsDumpsterType = { ([string]$args[0].FolderType) -like 'RecoverableItems*' -or ([string]$args[0].FolderType) -eq 'CalendarLogging' }
+    $DumpsterRoots = @($AllFolders | Where-Object { & $IsDumpsterType $_ } | ForEach-Object { [string]$_.FolderPath } | Where-Object { $_ })
+    $FolderStats = @($AllFolders | Where-Object {
+        if (& $IsDumpsterType $_) { return $false }
+        $Path = [string]$_.FolderPath
+        foreach ($Root in $DumpsterRoots) {
+          if ($Path.StartsWith($Root + '/', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+        return $true
       })
 
     $ArchiveSize = [long]0
