@@ -179,6 +179,11 @@
         Items folders (they are gathered by the separate Recoverable Items pass, so they were
         double-counted for any mailbox that used the fallback) and requests -ResultSize
         Unlimited so an archive with more than 1000 folders is not silently under-counted.
+    Updated: 30/09/26
+    By: PF Guglielmi (with Claude Code)
+    Changes: The HTML report no longer prints "AD Group:" on the Exchange Online and OneDrive
+        cards when no AD group filter is used. When -ADGroup and/or -ExcludeADGroup are used,
+        a subtitle under each card header lists the included and/or excluded AD group.
 #>
 
 [CmdletBinding()]
@@ -524,6 +529,37 @@ Function Format-PerObjectAverage {
     return "N/A (0 $ObjectLabel)"
   }
   return [math]::Round($Total / $Divisor / $CountValue, 2)
+}
+
+# Build the AD group filter subtitle shown under the Exchange Online and OneDrive card headers.
+# Returns an empty string when neither -ADGroup nor -ExcludeADGroup was used, so the report shows
+# nothing at all for unfiltered runs. Otherwise returns one line naming only the filters in use.
+# Group names are HTML-encoded since they are free text that ends up inside the report.
+Function Get-ADGroupFilterReportNote {
+  [CmdletBinding()]
+  param (
+    # Name of the AD group used with -ADGroup, or empty when that filter is not in use
+    [Parameter()]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$IncludeGroup,
+    # Name of the AD group used with -ExcludeADGroup, or empty when that filter is not in use
+    [Parameter()]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$ExcludeGroup
+  )
+  $Parts = @()
+  if (-not [string]::IsNullOrWhiteSpace($IncludeGroup)) {
+    $Parts += "Included AD group: $([System.Net.WebUtility]::HtmlEncode($IncludeGroup))"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ExcludeGroup)) {
+    $Parts += "Excluded AD group: $([System.Net.WebUtility]::HtmlEncode($ExcludeGroup))"
+  }
+  if ($Parts.Count -eq 0) {
+    return ''
+  }
+  return "<div class=`"card-header-subtitle`">$($Parts -join ' | ')</div>"
 }
 
 
@@ -3589,6 +3625,12 @@ $HTML_CODE = @"
             line-height: 2.4rem;
         }
 
+        .card-header-subtitle {
+            font-size: 1rem;
+            color: #6b6b6b;
+            padding: 0 0 12px 4px;
+        }
+
         .navigation-bar {
             display: flex;
             background-color: #060745;
@@ -3952,9 +3994,10 @@ $HTML_CODE = @"
                     </svg>
                 </div>
                 <div class="card-header-text">
-                    Exchange Online (AD Group: $ADGroup)
+                    Exchange Online
                 </div>
             </div>
+            $(Get-ADGroupFilterReportNote -IncludeGroup $ADGroup -ExcludeGroup $ExcludeADGroup)
 
             <table class="styled-table">
                 <thead>
@@ -4033,9 +4076,10 @@ $HTML_CODE = @"
                     </svg>
                 </div>
                 <div class="card-header-text">
-                    OneDrive (AD Group: $ADGroup)
+                    OneDrive
                 </div>
             </div>
+            $(Get-ADGroupFilterReportNote -IncludeGroup $ADGroup -ExcludeGroup $ExcludeADGroup)
 
             <table class="styled-table">
                 <thead>
