@@ -184,6 +184,14 @@
     Changes: The HTML report no longer prints "AD Group:" on the Exchange Online and OneDrive
         cards when no AD group filter is used. When -ADGroup and/or -ExcludeADGroup are used,
         a subtitle under each card header lists the included and/or excluded AD group.
+    Updated: 11/11/26
+    By: PF Guglielmi (with Claude Code)
+    Changes: -ADGroup / -ExcludeADGroup work again on Windows PowerShell 5.1. Writing the
+        group's UPN list used Out-File -Path, an alias that only exists in PowerShell 7, so
+        5.1 stopped with "A parameter cannot be found that matches parameter name 'Path'".
+        -UseAppAccess $true also works on 5.1 now: reading the app secret used
+        ConvertFrom-SecureString -AsPlainText (PowerShell 7 only), which failed the Exchange
+        Online connection.
 #>
 
 [CmdletBinding()]
@@ -1025,7 +1033,9 @@ if ($UseAppAccess -eq $true) {
         Write-Host "Connecting to the Microsoft Exchange Online Module to gather per-mailbox In Place Archive stats."
         try {
             $clientSecretSecure = Read-Host -Prompt "Password for user $clientId" -AsSecureString
-            $clientSecret = ConvertFrom-SecureString -SecureString $clientSecretSecure -AsPlainText   # legit:ignore
+            # NetworkCredential rather than ConvertFrom-SecureString -AsPlainText, which only
+            # exists in PowerShell 7 - on Windows PowerShell 5.1 it failed the EXO connect.
+            $clientSecret = [System.Net.NetworkCredential]::new('', $clientSecretSecure).Password   # legit:ignore
             $token = Get-AccessToken -clientId $clientId -clientSecret $clientSecret -tenantId $tenantId
             # A null token would fall through to an interactive login prompt; fail clearly instead.
             if (-not $token) { throw "Could not obtain an Exchange Online access token for app $clientId." }
@@ -1147,14 +1157,14 @@ Function Get-AzureAdGroupMemberUpn {
       Write-Host "[WARN] The Azure AD Group '$GroupName' does not contain any User Principal Names - nothing will be excluded." -foregroundcolor yellow
       # Still write the (empty) CSV, so troubleshooting references to -CSVFilename elsewhere
       # in the script point at a real, if empty, file rather than one that was never created.
-      $MembersByUserPrincipalName | Out-File -Path $CSVFilename
+      $MembersByUserPrincipalName | Out-File -FilePath $CSVFilename
       return @()
     }
     throw "The Azure AD Group '$GroupName' does not contain any User Principal Names."
   }
   Write-Host "# of $Label members found: $($MembersByUserPrincipalName.Count)" -foregroundcolor green
   Write-Host "$Label user principal names exported to CSV: $CSVFilename" -foregroundcolor green
-  $MembersByUserPrincipalName | Out-File -Path $CSVFilename
+  $MembersByUserPrincipalName | Out-File -FilePath $CSVFilename
   return $MembersByUserPrincipalName
 }
 
